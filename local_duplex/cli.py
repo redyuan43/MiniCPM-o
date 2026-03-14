@@ -14,7 +14,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("mode", choices=("audio", "omni"))
     parser.add_argument("--config", default=None, help="Path to a JSON config file")
     parser.add_argument("--model-path", default=None, help="Override model path or repo id")
-    parser.add_argument("--capture-device", default=None, help="Override ALSA capture device")
+    parser.add_argument("--capture-device", default=None, help="Override capture device selector (pipewire/default/device id/name)")
     parser.add_argument("--playback-device", default=None, help="Override ALSA playback device")
     parser.add_argument("--camera-device", default=None, help="Override V4L2 camera device path")
     parser.add_argument("--no-preview", action="store_true", help="Disable local OpenCV preview window")

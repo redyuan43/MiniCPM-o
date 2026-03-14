@@ -130,6 +130,30 @@
 - [Limitations](#limitations)
 - [Acknowledgements](#acknowledgements)
 
+## Local Duplex Quick Start
+
+This repository also includes a local Ubuntu full-duplex runtime for camera + microphone input and local speaker output without HTTP/WebRTC. For the full environment and deployment notes, see [docs/local_duplex_ubuntu24.md](./docs/local_duplex_ubuntu24.md).
+
+Use the commands below for the fastest local verification flow:
+
+```bash
+./scripts/run_local_duplex.sh omni
+./scripts/logs_local_duplex.sh
+./scripts/show_local_duplex_session.sh
+```
+
+What they do:
+
+- `./scripts/run_local_duplex.sh omni`: start a fresh local omni duplex session in the background, then print the latest runtime log and interaction summary.
+- `./scripts/logs_local_duplex.sh`: tail the raw engineering log at `.local_duplex/runtime.log`.
+- `./scripts/show_local_duplex_session.sh`: print the latest user-facing interaction summary from `.local_duplex/sessions/<session_id>/interaction.md`.
+
+If you need to inspect the available local input devices before running:
+
+```bash
+./scripts/list_local_duplex_audio_devices.sh
+```
+
 
 ## MiniCPM-o 4.5
 

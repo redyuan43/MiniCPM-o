@@ -11,3 +11,6 @@ sleep 3
 echo
 echo "Recent runtime log:"
 tail -n 80 "${ROOT_DIR}/.local_duplex/runtime.log"
+echo
+echo "Latest interaction summary:"
+"${ROOT_DIR}/scripts/show_local_duplex_session.sh" || true

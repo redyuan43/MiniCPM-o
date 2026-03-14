@@ -33,8 +33,13 @@ copy_path() {
   local rel="$1"
   local src="${ROOT_DIR}/${rel}"
   local dst="${BUNDLE_DIR}/${rel}"
-  mkdir -p "$(dirname "${dst}")"
-  rsync -a "${src}" "${dst}"
+  if [ -d "${src}" ]; then
+    mkdir -p "${dst}"
+    rsync -a "${src}/" "${dst}/"
+  else
+    mkdir -p "$(dirname "${dst}")"
+    rsync -a "${src}" "${dst}"
+  fi
 }
 
 copy_path ".gitignore"

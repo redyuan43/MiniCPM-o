@@ -1,9 +1,10 @@
-"""ALSA subprocess audio pipeline for local duplex runtime."""
+"""Local audio capture/playback pipeline for the duplex runtime."""
 
 from __future__ import annotations
 
 import base64
 from collections import deque
+import logging
 import math
 import queue
 import subprocess
@@ -12,12 +13,17 @@ import time
 from typing import Deque
 
 import numpy as np
+try:
+    import sounddevice as sd
+except ImportError:  # pragma: no cover - validated in runtime preflight
+    sd = None
 
 from local_duplex.config import AudioConfig
 
 
 FLOAT32_LE = "<f4"
 INT32_MAX = np.int32(2147483647)
+LOGGER = logging.getLogger("local_duplex.audio")
 
 
 def upsample_mono_24k_to_stereo_48k(audio: np.ndarray) -> np.ndarray:
@@ -48,51 +54,149 @@ def decode_model_audio(audio_base64: str) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.dtype(FLOAT32_LE)).copy()
 
 
-class ArecordCapture:
-    """Continuously reads raw float32 audio from arecord."""
+def ensure_sounddevice_available() -> None:
+    if sd is None:
+        raise RuntimeError(
+            "Missing Python dependency 'sounddevice'. "
+            "Run scripts/setup_duplex_env.sh to install the local duplex audio backend."
+        )
+
+
+def list_input_devices() -> list[tuple[int, dict]]:
+    ensure_sounddevice_available()
+    devices = sd.query_devices()
+    return [
+        (index, device)
+        for index, device in enumerate(devices)
+        if int(device.get("max_input_channels", 0)) > 0
+    ]
+
+
+def _find_pipewire_device_id() -> int | None:
+    for index, device in list_input_devices():
+        if "pipewire" in str(device.get("name", "")).lower():
+            return index
+    for index, device in list_input_devices():
+        if "default" in str(device.get("name", "")).lower():
+            return index
+    return None
+
+
+def _match_input_device_by_name(selector: str) -> int | None:
+    selector_lower = selector.strip().lower()
+    for index, device in list_input_devices():
+        if selector_lower == str(device.get("name", "")).strip().lower():
+            return index
+    for index, device in list_input_devices():
+        if selector_lower in str(device.get("name", "")).lower():
+            return index
+    return None
+
+
+def resolve_capture_device(device_selector: str | int | None) -> tuple[int | None, dict, str]:
+    ensure_sounddevice_available()
+    selector = "" if device_selector is None else str(device_selector).strip()
+
+    if not selector or selector.lower() == "default":
+        device_info = sd.query_devices(kind="input")
+        return None, device_info, f"default:{device_info['name']}"
+
+    if selector.lower() == "pipewire":
+        pipewire_device_id = _find_pipewire_device_id()
+        if pipewire_device_id is None:
+            device_info = sd.query_devices(kind="input")
+            return None, device_info, f"default:{device_info['name']}"
+        device_info = sd.query_devices(pipewire_device_id)
+        return pipewire_device_id, device_info, f"id={pipewire_device_id}:{device_info['name']}"
+
+    if selector.isdigit():
+        device_id = int(selector)
+        device_info = sd.query_devices(device_id)
+        if int(device_info.get("max_input_channels", 0)) < 1:
+            raise RuntimeError(f"Configured capture device id={device_id} has no input channels")
+        return device_id, device_info, f"id={device_id}:{device_info['name']}"
+
+    matched_device_id = _match_input_device_by_name(selector)
+    if matched_device_id is None:
+        available_names = ", ".join(str(device["name"]) for _, device in list_input_devices())
+        raise RuntimeError(
+            f"Unable to resolve capture device '{selector}'. "
+            f"Available input devices: {available_names or 'none'}"
+        )
+    device_info = sd.query_devices(matched_device_id)
+    return matched_device_id, device_info, f"id={matched_device_id}:{device_info['name']}"
+
+
+def validate_capture_device(
+    device_selector: str | int | None,
+    sample_rate: int,
+    channels: int = 1,
+    dtype: str = "float32",
+) -> tuple[int | None, dict, str]:
+    device_id, device_info, device_label = resolve_capture_device(device_selector)
+    ensure_sounddevice_available()
+    sd.check_input_settings(
+        device=device_id,
+        samplerate=sample_rate,
+        channels=channels,
+        dtype=dtype,
+    )
+    return device_id, device_info, device_label
+
+
+class SoundDeviceCapture:
+    """Continuously reads float32 audio from a PortAudio input stream."""
 
     def __init__(self, config: AudioConfig) -> None:
         self.config = config
         self.read_samples = config.input_sample_rate * config.read_window_ms // 1000
-        self.read_bytes = self.read_samples * 4
         self.chunk_samples = config.input_sample_rate * config.chunk_ms // 1000
         self._buffers: Deque[np.ndarray] = deque()
         self._buffered_samples = 0
         self._hold_samples = 0
         self._interrupt_requested = False
         self._playback_active = False
+        self._playback_active_ms = 0.0
+        self._playback_remaining_ms = 0.0
         self._lock = threading.Condition()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._proc: subprocess.Popen[bytes] | None = None
+        self._reader_error: str | None = None
+        self._stream = None
+        self._device_label = "unresolved"
 
     def start(self) -> None:
-        cmd = [
-            "arecord",
-            "-D",
+        device_id, device_info, device_label = validate_capture_device(
             self.config.capture_device,
-            "-q",
-            "-t",
-            "raw",
-            "-f",
-            "FLOAT_LE",
-            "-c",
-            "1",
-            "-r",
-            str(self.config.input_sample_rate),
-        ]
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
+            sample_rate=self.config.input_sample_rate,
+            channels=1,
+            dtype="float32",
         )
-        self._thread = threading.Thread(target=self._reader_loop, name="arecord-capture", daemon=True)
-        self._thread.start()
+        self._device_label = device_label
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.config.input_sample_rate,
+                blocksize=self.read_samples,
+                device=device_id,
+                dtype="float32",
+                channels=1,
+                callback=self._record_callback,
+                finished_callback=self._finished_callback,
+            )
+            self._stream.start()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to open input stream ({device_label}): {exc}") from exc
+        LOGGER.info(
+            "Using audio input device: %s (channels=%s default_rate=%.1f)",
+            device_label,
+            int(device_info.get("max_input_channels", 0)),
+            float(device_info.get("default_samplerate", 0.0)),
+        )
 
-    def set_playback_active(self, active: bool) -> None:
+    def set_playback_state(self, active: bool, active_ms: float, remaining_ms: float) -> None:
         with self._lock:
             self._playback_active = active
+            self._playback_active_ms = active_ms
+            self._playback_remaining_ms = remaining_ms
             if not active:
                 self._hold_samples = 0
 
@@ -106,9 +210,12 @@ class ArecordCapture:
         with self._lock:
             while not self._stop.is_set() and self._buffered_samples < self.chunk_samples:
                 self._lock.wait(timeout=0.2)
-                self._check_proc_state()
+                self._check_stream_state()
 
             if self._stop.is_set():
+                self._check_stream_state()
+                if self._reader_error:
+                    raise RuntimeError(f"Audio capture stopped: {self._reader_error}")
                 raise RuntimeError("Audio capture stopped")
 
             out = np.empty(self.chunk_samples, dtype=np.float32)
@@ -130,47 +237,63 @@ class ArecordCapture:
         self._stop.set()
         with self._lock:
             self._lock.notify_all()
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        if self._stream is not None:
             try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        if self._thread:
-            self._thread.join(timeout=1)
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
 
-    def _reader_loop(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
+    def _record_callback(self, indata, frames, _time_info, status) -> None:
+        if self._stop.is_set():
+            return
+        if status:
+            LOGGER.warning("Input stream status on %s: %s", self._device_label, status)
+
         hold_target = max(1, self.config.input_sample_rate * self.config.interrupt_hold_ms // 1000)
-        while not self._stop.is_set():
-            raw = self._proc.stdout.read(self.read_bytes)
-            if not raw:
-                break
-            chunk = np.frombuffer(raw, dtype=np.dtype(FLOAT32_LE))
-            if chunk.size == 0:
-                continue
-            samples = chunk.copy()
-            rms = float(math.sqrt(np.mean(samples * samples))) if samples.size else 0.0
-            with self._lock:
-                self._buffers.append(samples)
-                self._buffered_samples += samples.size
-                if self._playback_active and rms >= self.config.interrupt_rms_threshold:
-                    self._hold_samples += samples.size
-                    if self._hold_samples >= hold_target:
-                        self._interrupt_requested = True
-                else:
-                    self._hold_samples = 0
-                self._lock.notify_all()
+        samples = np.asarray(indata, dtype=np.float32).reshape(frames, -1)
+        if samples.size == 0:
+            return
+        mono = samples[:, 0].copy()
+        rms = float(math.sqrt(np.mean(mono * mono))) if mono.size else 0.0
+        peak = float(np.max(np.abs(mono))) if mono.size else 0.0
+        with self._lock:
+            self._buffers.append(mono)
+            self._buffered_samples += mono.size
+            playback_interruptible = (
+                self._playback_active
+                and self._playback_active_ms >= self.config.interrupt_min_playback_ms
+                and self._playback_remaining_ms > self.config.interrupt_tail_protect_ms
+            )
+            if (
+                playback_interruptible
+                and rms >= self.config.interrupt_rms_threshold
+                and peak >= self.config.interrupt_peak_threshold
+            ):
+                self._hold_samples += mono.size
+                if self._hold_samples >= hold_target:
+                    self._interrupt_requested = True
+            else:
+                self._hold_samples = 0
+            self._lock.notify_all()
+
+    def _finished_callback(self) -> None:
+        if self._stop.is_set():
+            return
+        self._reader_error = f"input stream finished unexpectedly on {self._device_label}"
         self._stop.set()
         with self._lock:
             self._lock.notify_all()
 
-    def _check_proc_state(self) -> None:
-        if self._proc and self._proc.poll() is not None:
-            stderr = b""
-            if self._proc.stderr is not None:
-                stderr = self._proc.stderr.read()
-            raise RuntimeError(f"arecord exited unexpectedly: {stderr.decode(errors='ignore').strip()}")
+    def _check_stream_state(self) -> None:
+        if self._stream is not None and self._stream.closed and not self._stop.is_set():
+            raise RuntimeError(f"input stream closed unexpectedly on {self._device_label}")
+        if self._reader_error:
+            raise RuntimeError(self._reader_error)
 
 
 class AplayPlayback:
@@ -183,6 +306,9 @@ class AplayPlayback:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._proc: subprocess.Popen[bytes] | None = None
+        self._timing_lock = threading.Lock()
+        self._active_since_monotonic = 0.0
+        self._playback_deadline_monotonic = 0.0
 
     def start(self) -> None:
         cmd = [
@@ -210,12 +336,41 @@ class AplayPlayback:
 
     @property
     def active(self) -> bool:
-        return self._active.is_set()
+        if not self._active.is_set():
+            return False
+        with self._timing_lock:
+            if time.monotonic() >= self._playback_deadline_monotonic:
+                self._active.clear()
+                self._active_since_monotonic = 0.0
+                return False
+            return True
+
+    @property
+    def active_duration_ms(self) -> float:
+        if not self.active:
+            return 0.0
+        with self._timing_lock:
+            return max(0.0, (time.monotonic() - self._active_since_monotonic) * 1000)
+
+    @property
+    def remaining_ms(self) -> float:
+        if not self.active:
+            return 0.0
+        with self._timing_lock:
+            return max(0.0, (self._playback_deadline_monotonic - time.monotonic()) * 1000)
 
     def enqueue_model_audio(self, mono_audio_24k: np.ndarray) -> None:
         stereo = upsample_mono_24k_to_stereo_48k(mono_audio_24k)
         pcm = float_stereo_to_pcm_s32(stereo)
         self._queue.put(pcm, timeout=5)
+        duration_s = float(len(mono_audio_24k)) / float(self.config.model_output_sample_rate)
+        with self._timing_lock:
+            now = time.monotonic()
+            if not self._active.is_set():
+                self._active_since_monotonic = now
+                self._playback_deadline_monotonic = now
+            base = max(now, self._playback_deadline_monotonic)
+            self._playback_deadline_monotonic = base + duration_s
         self._active.set()
 
     def clear(self) -> None:
@@ -224,6 +379,9 @@ class AplayPlayback:
                 self._queue.get_nowait()
             except queue.Empty:
                 self._active.clear()
+                with self._timing_lock:
+                    self._active_since_monotonic = 0.0
+                    self._playback_deadline_monotonic = 0.0
                 return
 
     def stop(self) -> None:
@@ -243,7 +401,11 @@ class AplayPlayback:
             try:
                 chunk = self._queue.get(timeout=0.1)
             except queue.Empty:
-                self._active.clear()
+                if self.remaining_ms <= 0:
+                    self._active.clear()
+                    with self._timing_lock:
+                        self._active_since_monotonic = 0.0
+                        self._playback_deadline_monotonic = 0.0
                 self._check_proc_state()
                 continue
 
@@ -252,9 +414,6 @@ class AplayPlayback:
                 self._proc.stdin.flush()
             except BrokenPipeError as exc:
                 raise RuntimeError("aplay pipe closed unexpectedly") from exc
-            finally:
-                if self._queue.empty():
-                    self._active.clear()
 
     def _check_proc_state(self) -> None:
         if self._proc and self._proc.poll() is not None:

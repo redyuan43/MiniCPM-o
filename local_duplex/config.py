@@ -42,6 +42,9 @@ class AudioConfig:
     read_window_ms: int
     chunk_ms: int
     interrupt_rms_threshold: float
+    interrupt_peak_threshold: float
+    interrupt_min_playback_ms: int
+    interrupt_tail_protect_ms: int
     interrupt_hold_ms: int
     output_queue_max_chunks: int
     reference_audio_path: str
@@ -67,6 +70,8 @@ class SessionConfig:
     top_k: int
     top_p: float
     listen_prob_scale: float
+    speech_eager_chunks: int
+    speech_eager_listen_prob_scale: float
 
 
 @dataclass(slots=True)
@@ -74,8 +79,18 @@ class RuntimeConfig:
     runtime_dir: str
     log_level: str
     session_max_chunks: int
+    enable_speech_listen_reset: bool
     session_reset_after_speech_listens: int
+    session_min_chunks_before_speech_reset: int
     speech_detect_rms: float
+    speech_activation_chunks: int
+    speech_activation_min_rms: float
+    speech_activation_grace_after_reset_chunks: int
+    consistency_error_reset_threshold: int
+    kv_reset_threshold: int
+    stuck_listen_speech_chunks: int
+    speak_latency_budget_ms: int
+    listen_latency_budget_ms: int
 
 
 @dataclass(slots=True)
@@ -96,27 +111,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "preload_both_tts": True,
     },
     "audio": {
-        "capture_device": "plughw:1,0",
+        "capture_device": "pipewire",
         "playback_device": "hw:CARD=NVidia,DEV=3",
         "input_sample_rate": 16000,
         "model_output_sample_rate": 24000,
         "playback_sample_rate": 48000,
         "playback_channels": 2,
         "read_window_ms": 20,
-        "chunk_ms": 500,
-        "interrupt_rms_threshold": 0.015,
-        "interrupt_hold_ms": 200,
+        "chunk_ms": 400,
+        "interrupt_rms_threshold": 0.05,
+        "interrupt_peak_threshold": 0.25,
+        "interrupt_min_playback_ms": 600,
+        "interrupt_tail_protect_ms": 250,
+        "interrupt_hold_ms": 260,
         "output_queue_max_chunks": 32,
         "reference_audio_path": "third_party/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav",
     },
     "video": {
         "camera_device": "/dev/v4l/by-id/usb-046d_Logitech_BRIO_AE03BDC5-video-index0",
-        "capture_width": 1280,
-        "capture_height": 720,
+        "capture_width": 640,
+        "capture_height": 360,
         "capture_fps": 15,
-        "frame_interval_ms": 1000,
+        "frame_interval_ms": 4000,
         "max_slice_nums": 1,
-        "preview": True,
+        "preview": False,
     },
     "session": {
         "system_prompt": (
@@ -124,18 +142,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "stay interruptible, and mention important scene changes proactively."
         ),
         "force_listen_count": 4,
-        "max_new_speak_tokens_per_chunk": 12,
+        "max_new_speak_tokens_per_chunk": 14,
         "temperature": 0.7,
         "top_k": 20,
         "top_p": 0.8,
-        "listen_prob_scale": 1.0,
+        "listen_prob_scale": 0.9,
+        "speech_eager_chunks": 2,
+        "speech_eager_listen_prob_scale": 0.8,
     },
     "runtime": {
         "runtime_dir": ".local_duplex",
         "log_level": "INFO",
-        "session_max_chunks": 80,
-        "session_reset_after_speech_listens": 6,
+        "session_max_chunks": 240,
+        "enable_speech_listen_reset": False,
+        "session_reset_after_speech_listens": 18,
+        "session_min_chunks_before_speech_reset": 18,
         "speech_detect_rms": 0.01,
+        "speech_activation_chunks": 2,
+        "speech_activation_min_rms": 0.015,
+        "speech_activation_grace_after_reset_chunks": 6,
+        "consistency_error_reset_threshold": 1,
+        "kv_reset_threshold": 2,
+        "stuck_listen_speech_chunks": 10,
+        "speak_latency_budget_ms": 1100,
+        "listen_latency_budget_ms": 250,
     },
 }
 

@@ -43,6 +43,7 @@ uv venv --seed --python "${PYTHON_VERSION}" "${VENV_DIR}"
   "pytest>=9.0.0" \
   "pytest-asyncio>=1.3.0" \
   "opencv-python>=4.10.0" \
+  "sounddevice>=0.5.2" \
   "soundfile>=0.13.1" \
   "pillow==10.4.0" \
   "librosa==0.9.0" \

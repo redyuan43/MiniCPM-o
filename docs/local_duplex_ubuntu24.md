@@ -5,7 +5,7 @@ This repo now includes a local duplex runtime for MiniCPM-o 4.5 that keeps camer
 ## Hardware Defaults
 
 - Inference GPU: `GPU 0 / RTX 4060 Ti`
-- Microphone: `DJI MIC MINI` via `plughw:1,0`
+- Microphone: `DJI MIC MINI` via `sounddevice` + `pipewire`
 - Speaker: `NVIDIA HDMI/DP HDA` via `hw:CARD=NVidia,DEV=3`
 - Camera: `Logitech BRIO` via `/dev/v4l/by-id/usb-046d_Logitech_BRIO_AE03BDC5-video-index0`
 
@@ -91,4 +91,4 @@ Audio-only mode:
 
 - The runtime checks that the active NVIDIA HDMI sink is present before starting.
 - The OpenCV preview window is enabled in `omni` mode by default; use `--no-preview` to disable it.
-- If you need a different mic, speaker, or camera, override the corresponding fields in the config file or CLI flags.
+- If you need a different mic, run `./scripts/list_local_duplex_audio_devices.sh` first, then override `capture_device` with `pipewire`, `default`, a numeric device ID, or a device-name fragment.
