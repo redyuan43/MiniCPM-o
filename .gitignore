@@ -1,3 +1,7 @@
 *.bk
 __pycache__
 .DS_Store
+.venv/
+.local_duplex/
+third_party/models/
+.serena/

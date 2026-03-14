@@ -1,0 +1,48 @@
+{
+  "model": {
+    "model_path": "openbmb/MiniCPM-o-4_5-awq",
+    "attn_implementation": "sdpa",
+    "device": "cuda",
+    "compile": false,
+    "preload_both_tts": true
+  },
+  "audio": {
+    "capture_device": "plughw:1,0",
+    "playback_device": "hw:CARD=NVidia,DEV=3",
+    "input_sample_rate": 16000,
+    "model_output_sample_rate": 24000,
+    "playback_sample_rate": 48000,
+    "playback_channels": 2,
+    "read_window_ms": 20,
+    "chunk_ms": 500,
+    "interrupt_rms_threshold": 0.015,
+    "interrupt_hold_ms": 200,
+    "output_queue_max_chunks": 32,
+    "reference_audio_path": "third_party/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav"
+  },
+  "video": {
+    "camera_device": "/dev/v4l/by-id/usb-046d_Logitech_BRIO_AE03BDC5-video-index0",
+    "capture_width": 640,
+    "capture_height": 360,
+    "capture_fps": 15,
+    "frame_interval_ms": 4000,
+    "max_slice_nums": 1,
+    "preview": true
+  },
+  "session": {
+    "system_prompt": "You are a bilingual robot assistant. Respond with short spoken answers, stay interruptible, and mention important scene changes proactively.",
+    "force_listen_count": 4,
+    "max_new_speak_tokens_per_chunk": 12,
+    "temperature": 0.7,
+    "top_k": 20,
+    "top_p": 0.8,
+    "listen_prob_scale": 1.0
+  },
+  "runtime": {
+    "runtime_dir": ".local_duplex",
+    "log_level": "INFO",
+    "session_max_chunks": 80,
+    "session_reset_after_speech_listens": 6,
+    "speech_detect_rms": 0.01
+  }
+}
