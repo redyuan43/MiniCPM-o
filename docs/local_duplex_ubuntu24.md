@@ -30,6 +30,7 @@ The setup script:
 - creates `.venv/local-duplex311`
 - installs CUDA-enabled PyTorch for Python 3.11
 - installs the local runtime requirements
+- prepares the workspace for repo-local Hugging Face model storage under `third_party/models/huggingface`
 
 ## Model Configuration
 
@@ -38,6 +39,17 @@ The default config file is [configs/local_duplex.json](/home/ivan/github/MiniCPM
 Default model:
 
 - `openbmb/MiniCPM-o-4_5-awq`
+
+Localize the model cache into the current project before packaging or offline use:
+
+```bash
+./scripts/localize_models.sh
+```
+
+The launcher now prefers:
+
+- `HF_HOME=$PWD/third_party/models/huggingface`
+- `HF_HUB_CACHE=$PWD/third_party/models/huggingface/hub`
 
 If the model is already downloaded locally, set `"model_path"` to that local directory or override it from the CLI:
 
@@ -61,6 +73,12 @@ Background helper scripts:
 ./scripts/start_local_duplex.sh omni
 ./scripts/logs_local_duplex.sh
 ./scripts/stop_local_duplex.sh
+```
+
+Bundle the runtime, local venv, and localized models:
+
+```bash
+./scripts/package_local_duplex_bundle.sh
 ```
 
 Audio-only mode:

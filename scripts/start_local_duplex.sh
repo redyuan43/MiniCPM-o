@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv/local-duplex311"
 RUNTIME_DIR="${ROOT_DIR}/.local_duplex"
+LOCAL_HF_HOME="${ROOT_DIR}/third_party/models/huggingface"
 MODE="${1:-omni}"
 
 mkdir -p "${RUNTIME_DIR}"
@@ -25,6 +26,8 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HOME="${HF_HOME:-${LOCAL_HF_HOME}}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${LOCAL_HF_HOME}/hub}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/third_party/MiniCPM-o-Demo:${PYTHONPATH:-}"
 

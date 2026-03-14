@@ -13,6 +13,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 mkdir -p "${ROOT_DIR}/third_party"
+mkdir -p "${ROOT_DIR}/third_party/models/huggingface/hub"
 if [ ! -d "${ROOT_DIR}/third_party/MiniCPM-o-Demo/.git" ]; then
   git clone --depth 1 "https://github.com/OpenBMB/MiniCPM-o-Demo.git" "${ROOT_DIR}/third_party/MiniCPM-o-Demo"
 fi

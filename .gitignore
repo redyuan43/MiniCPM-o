@@ -5,3 +5,4 @@ __pycache__
 .local_duplex/
 third_party/models/
 .serena/
+dist/
