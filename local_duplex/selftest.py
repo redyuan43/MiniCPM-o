@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import asdict
+from datetime import datetime
 import json
 import os
 import re
@@ -687,6 +688,23 @@ def _read_wav_float32(wav_path: Path) -> tuple[np.ndarray, int]:
     return audio, sample_rate
 
 
+def _read_wav_channels_float32(wav_path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(wav_path), "rb") as fh:
+        n_channels = fh.getnchannels()
+        sample_width = fh.getsampwidth()
+        sample_rate = fh.getframerate()
+        frames = fh.readframes(fh.getnframes())
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise RuntimeError(f"Unsupported WAV sample width: {sample_width}")
+    if n_channels <= 1:
+        return audio.reshape(-1, 1), sample_rate
+    return audio.reshape(-1, n_channels).astype(np.float32), sample_rate
+
+
 def _write_wav_float32(wav_path: Path, audio: np.ndarray, sample_rate: int) -> None:
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 0.9999695)
@@ -696,6 +714,29 @@ def _write_wav_float32(wav_path: Path, audio: np.ndarray, sample_rate: int) -> N
         fh.setsampwidth(2)
         fh.setframerate(sample_rate)
         fh.writeframes(pcm.tobytes())
+
+
+def _audio_peak_rms(audio: np.ndarray) -> tuple[float, float]:
+    mono = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if mono.size == 0:
+        return 0.0, 0.0
+    peak = float(np.max(np.abs(mono)))
+    rms = float(np.sqrt(np.mean(mono * mono)))
+    return peak, rms
+
+
+def _resample_linear(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
+    mono = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if mono.size == 0 or from_sr == to_sr:
+        return mono
+    target_len = int(round(mono.size * to_sr / float(from_sr)))
+    if target_len <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    return np.interp(
+        np.linspace(0, mono.size - 1, target_len, dtype=np.float32),
+        np.arange(mono.size, dtype=np.float32),
+        mono,
+    ).astype(np.float32)
 
 
 def _mix_prompt_with_background(
@@ -770,6 +811,209 @@ def _transcribe_wav_with_capswriter(wav_path: Path) -> dict[str, Any]:
     raise RuntimeError(
         f"Unable to parse CapsWriter ASR JSON for {wav_path}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+def _collect_session_ai_audio_paths(session_dir: Path) -> list[Path]:
+    jsonl_path = session_dir / "interaction.jsonl"
+    if not jsonl_path.exists():
+        return []
+    audio_paths: list[Path] = []
+    for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event.get("type") != "chunk":
+            continue
+        assistant = event.get("assistant", {})
+        rel_path = str(assistant.get("audio_path") or "").strip()
+        if not rel_path:
+            continue
+        path = session_dir / rel_path
+        if path.exists():
+            audio_paths.append(path)
+    return audio_paths
+
+
+def _extract_best_channel_from_merged_replay(
+    merged_replay: Path,
+    output_wav: Path,
+) -> dict[str, Any] | None:
+    if not merged_replay.exists():
+        return None
+    channels, sample_rate = _read_wav_channels_float32(merged_replay)
+    if channels.size == 0:
+        return None
+    best_index = 0
+    best_audio = channels[:, 0]
+    best_peak, best_rms = _audio_peak_rms(best_audio)
+    channel_stats = [{"channel": 0, "peak": round(best_peak, 6), "rms": round(best_rms, 6)}]
+    for index in range(1, channels.shape[1]):
+        candidate = channels[:, index]
+        peak, rms = _audio_peak_rms(candidate)
+        channel_stats.append({"channel": index, "peak": round(peak, 6), "rms": round(rms, 6)})
+        if rms > best_rms or (rms == best_rms and peak > best_peak):
+            best_index = index
+            best_audio = candidate
+            best_peak = peak
+            best_rms = rms
+    if best_peak <= 1e-5 and best_rms <= 1e-6:
+        return None
+    _write_wav_float32(output_wav, best_audio, sample_rate)
+    return {
+        "source": "merged_replay_best_channel",
+        "path": str(output_wav),
+        "sample_rate": sample_rate,
+        "channel_index": best_index,
+        "peak": round(best_peak, 6),
+        "rms": round(best_rms, 6),
+        "channel_stats": channel_stats,
+    }
+
+
+def _build_session_ai_replay(
+    session_dir: Path,
+    output_wav: Path,
+) -> dict[str, Any] | None:
+    chunks: list[np.ndarray] = []
+    source_paths = _collect_session_ai_audio_paths(session_dir)
+    for audio_path in source_paths:
+        if audio_path.suffix == ".wav":
+            audio, sample_rate = _read_wav_float32(audio_path)
+        elif audio_path.suffix == ".f32":
+            audio = np.frombuffer(audio_path.read_bytes(), dtype=np.float32).copy()
+            sample_rate = 24000
+        else:
+            continue
+        if sample_rate != 16000:
+            audio = _resample_linear(audio, sample_rate, 16000)
+            sample_rate = 16000
+        if audio.size:
+            chunks.append(audio.astype(np.float32, copy=False))
+    if not chunks:
+        return None
+    merged = np.concatenate(chunks)
+    peak, rms = _audio_peak_rms(merged)
+    if peak <= 1e-5 and rms <= 1e-6:
+        return None
+    _write_wav_float32(output_wav, merged, 16000)
+    return {
+        "source": "session_ai_audio",
+        "path": str(output_wav),
+        "sample_rate": 16000,
+        "chunk_count": len(chunks),
+        "peak": round(peak, 6),
+        "rms": round(rms, 6),
+    }
+
+
+def _started_at_unix_ts(summary: dict[str, Any]) -> float:
+    started_at = str(summary.get("started_at") or "").strip()
+    if not started_at:
+        return 0.0
+    try:
+        return datetime.fromisoformat(started_at).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _find_latest_worker_tts_dir(session_dir: Path, mode: str, summary: dict[str, Any]) -> Path | None:
+    worker_root = RUNTIME_DIR / "gguf_worker"
+    if not worker_root.exists():
+        return None
+    prefix = f"{mode}_"
+    session_started_ts = _started_at_unix_ts(summary)
+    session_finished_ts = max(session_started_ts, session_dir.stat().st_mtime)
+    candidates: list[tuple[float, Path]] = []
+    for path in worker_root.iterdir():
+        if not path.is_dir() or not path.name.startswith(prefix):
+            continue
+        tts_dir = path / "worker_output" / "tts_wav"
+        if not tts_dir.exists():
+            continue
+        mtime = tts_dir.stat().st_mtime
+        if session_started_ts and mtime < session_started_ts - 120:
+            continue
+        if session_finished_ts and mtime > session_finished_ts + 120:
+            continue
+        candidates.append((mtime, tts_dir))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _build_worker_tts_replay(
+    session_dir: Path,
+    mode: str,
+    summary: dict[str, Any],
+    output_wav: Path,
+) -> dict[str, Any] | None:
+    tts_dir = _find_latest_worker_tts_dir(session_dir, mode, summary)
+    if tts_dir is None:
+        return None
+    chunks: list[np.ndarray] = []
+    source_paths = sorted(tts_dir.glob("wav_*.wav"))
+    for wav_path in source_paths:
+        audio, sample_rate = _read_wav_float32(wav_path)
+        if sample_rate != 16000:
+            audio = _resample_linear(audio, sample_rate, 16000)
+        if audio.size:
+            chunks.append(audio.astype(np.float32, copy=False))
+    if not chunks:
+        return None
+    merged = np.concatenate(chunks)
+    peak, rms = _audio_peak_rms(merged)
+    if peak <= 1e-5 and rms <= 1e-6:
+        return None
+    _write_wav_float32(output_wav, merged, 16000)
+    return {
+        "source": "gguf_worker_tts_wav",
+        "path": str(output_wav),
+        "sample_rate": 16000,
+        "chunk_count": len(chunks),
+        "worker_tts_dir": str(tts_dir),
+        "peak": round(peak, 6),
+        "rms": round(rms, 6),
+    }
+
+
+def _prepare_assistant_asr_input(
+    session_dir: Path,
+    mode: str,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    temp_dir = session_dir / "selftest_tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    merged_replay = session_dir / "merged_replay.wav"
+
+    merged_candidate = _extract_best_channel_from_merged_replay(
+        merged_replay,
+        temp_dir / "assistant_asr_from_merged_replay.wav",
+    )
+    if merged_candidate is not None:
+        return merged_candidate
+
+    session_candidate = _build_session_ai_replay(
+        session_dir,
+        temp_dir / "assistant_asr_from_session_ai.wav",
+    )
+    if session_candidate is not None:
+        return session_candidate
+
+    worker_candidate = _build_worker_tts_replay(
+        session_dir,
+        mode,
+        summary,
+        temp_dir / "assistant_asr_from_worker_tts.wav",
+    )
+    if worker_candidate is not None:
+        return worker_candidate
+
+    return {
+        "source": "missing",
+        "path": "",
+        "sample_rate": 0,
+    }
 
 
 def _latest_session_dir() -> Path:
@@ -878,7 +1122,6 @@ def _score_result(
     step_artifacts: list[dict[str, Any]],
 ) -> ScenarioResult:
     summary_path = session_dir / "summary.json"
-    merged_replay = session_dir / "merged_replay.wav"
     summary = _load_summary(summary_path)
     assistant_text, turns, speak_latency_ms = _collect_assistant_text(summary_path)
     assistant_turn_stability = _assistant_turn_stability(summary)
@@ -904,9 +1147,16 @@ def _score_result(
             }
         )
 
+    assistant_asr_input = _prepare_assistant_asr_input(
+        session_dir,
+        str(summary.get("mode") or scenario.mode),
+        summary,
+    )
     playback_asr = {"text": ""}
-    if merged_replay.exists():
-        playback_asr = _transcribe_wav_with_capswriter(merged_replay)
+    assistant_asr_path_str = str(assistant_asr_input.get("path") or "").strip()
+    assistant_asr_path = Path(assistant_asr_path_str) if assistant_asr_path_str else None
+    if assistant_asr_path is not None and assistant_asr_path.is_file():
+        playback_asr = _transcribe_wav_with_capswriter(assistant_asr_path)
 
     prompt_similarity = sum(prompt_scores) / len(prompt_scores) if prompt_scores else 0.0
     assistant_similarity = (
@@ -997,6 +1247,7 @@ def _score_result(
         metrics={
             "summary": summary,
             "assistant_asr": playback_asr,
+            "assistant_asr_input": assistant_asr_input,
             "step_assistant_texts": step_assistant_texts,
         },
     )
