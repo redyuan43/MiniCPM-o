@@ -38,6 +38,7 @@ class InteractionSessionLogger:
         self._started_at = time.time()
         self._events: list[dict[str, Any]] = []
         self._recorder = self._create_vendor_recorder()
+        self._backend_metadata: dict[str, Any] = {}
         self._finalized = False
 
         self.latest_session_path.write_text(str(self.session_dir), encoding="utf-8")
@@ -83,6 +84,18 @@ class InteractionSessionLogger:
                 "assistant_turn_role": assistant_turn_role,
             }
         )
+        self._rewrite_outputs()
+
+    def set_backend_metadata(self, metadata: dict[str, Any]) -> None:
+        clean_metadata = {key: value for key, value in metadata.items() if value not in (None, "", [])}
+        if not clean_metadata:
+            return
+        self._backend_metadata.update(clean_metadata)
+        if self._recorder is not None:
+            try:
+                self._recorder.update_config(clean_metadata)
+            except Exception:
+                LOGGER.exception("Failed to forward backend metadata to vendor session recorder")
         self._rewrite_outputs()
 
     def record_reset(self, reason: str, chunk_index: int) -> None:
@@ -363,6 +376,7 @@ class InteractionSessionLogger:
             "session_id": self.session_id,
             "mode": self.mode,
             "backend": self.config.model.backend,
+            "backend_metadata": dict(self._backend_metadata),
             "model_variant": (
                 self.config.model.gguf_variant if self.config.model.backend == "gguf" else "awq"
             ),

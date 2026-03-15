@@ -917,6 +917,12 @@ def _started_at_unix_ts(summary: dict[str, Any]) -> float:
 
 
 def _find_latest_worker_tts_dir(session_dir: Path, mode: str, summary: dict[str, Any]) -> Path | None:
+    backend_metadata = summary.get("backend_metadata") or {}
+    explicit_tts_dir = str(backend_metadata.get("gguf_worker_tts_dir") or "").strip()
+    if explicit_tts_dir:
+        explicit_path = Path(explicit_tts_dir)
+        if explicit_path.exists():
+            return explicit_path
     worker_root = RUNTIME_DIR / "gguf_worker"
     if not worker_root.exists():
         return None

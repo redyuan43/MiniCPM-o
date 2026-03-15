@@ -56,6 +56,9 @@ class BaseDuplexBackend:
     def is_vision_oom(self, exc: Exception) -> bool:
         return isinstance(exc, torch.OutOfMemoryError)
 
+    def runtime_metadata(self) -> dict[str, Any]:
+        return {}
+
 
 class PytorchDuplexBackend(BaseDuplexBackend):
     """Current UnifiedProcessor-based duplex backend."""
@@ -238,6 +241,15 @@ class GgufDuplexBackend(BaseDuplexBackend):
 
     def is_vision_oom(self, exc: Exception) -> bool:
         return "out of memory" in str(exc).lower()
+
+    def runtime_metadata(self) -> dict[str, Any]:
+        if self._client is None:
+            return {}
+        return {
+            "gguf_worker_runtime_dir": str(self._client.worker_runtime_dir),
+            "gguf_worker_output_dir": str(self._client.worker_output_dir),
+            "gguf_worker_tts_dir": str(self._client.worker_tts_dir),
+        }
 
 
 def create_duplex_backend(config: DuplexRuntimeConfig, mode: str) -> BaseDuplexBackend:

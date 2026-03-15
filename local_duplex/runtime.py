@@ -109,6 +109,7 @@ class LocalDuplexRunner:
         self._attach_runtime_signal_watchers()
         self._backend.load()
         self._session_logger = InteractionSessionLogger(self.runtime_dir, self.mode, self.config)
+        self._session_logger.set_backend_metadata(self._backend.runtime_metadata())
         LOGGER.info("Starting local %s duplex session", self.mode)
         LOGGER.info("Using duplex backend: %s", self._backend.backend_name)
         LOGGER.info("Interaction session log directory: %s", self._session_logger.session_path)

@@ -63,10 +63,12 @@ class GgufWorkerClient:
         self._worker_runtime_dir = Path(config.runtime.runtime_dir) / "gguf_worker" / session_tag
         self._input_dir = self._worker_runtime_dir / "inputs"
         self._output_dir = self._worker_runtime_dir / "worker_output"
+        self._tts_wav_dir = self._output_dir / "tts_wav"
         self._input_dir.mkdir(parents=True, exist_ok=True)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._pending_audio_path: Path | None = None
         self._pending_frame_path: Path | None = None
+        self._last_loaded_wav_index = -1
 
     def start(self) -> None:
         cmd = [self.config.model.gguf_worker_bin]
@@ -152,7 +154,21 @@ class GgufWorkerClient:
         )
         self._current_chunk_index += 1
         audio_data = None
-        audio_paths = response.get("audio_wav_paths") or []
+        response_audio_paths = [str(path) for path in (response.get("audio_wav_paths") or []) if path]
+        audio_paths = list(response_audio_paths)
+        stop_reason = str(response.get("stop_reason", "empty") or "empty")
+        backend_end_of_turn = bool(response.get("backend_end_of_turn", response.get("end_of_turn", False)))
+        should_collect_audio = (
+            not bool(response.get("is_listen", True))
+            or bool(response.get("end_of_turn", False))
+            or bool(response.get("text"))
+        )
+        fallback_audio_paths = self._collect_missing_worker_audio_paths(
+            should_wait=should_collect_audio,
+            end_of_turn=backend_end_of_turn,
+        )
+        if fallback_audio_paths:
+            audio_paths = self._merge_audio_paths(audio_paths, fallback_audio_paths)
         if audio_paths:
             audio = self._load_worker_audio(audio_paths)
             if audio.size:
@@ -163,9 +179,9 @@ class GgufWorkerClient:
             text=clean_text,
             audio_data=audio_data,
             end_of_turn=bool(response.get("end_of_turn", False)),
-            backend_end_of_turn=bool(response.get("backend_end_of_turn", response.get("end_of_turn", False))),
+            backend_end_of_turn=backend_end_of_turn,
             ended_with_listen=bool(response.get("ended_with_listen", False)),
-            stop_reason=str(response.get("stop_reason", "empty") or "empty"),
+            stop_reason=stop_reason,
             current_time=int(response.get("chunk_index", self._current_chunk_index - 1)),
             cost_all_ms=float(response["cost_all_ms"]) if response.get("cost_all_ms") is not None else None,
             cost_llm_ms=float(response["decode_ms"]) if response.get("decode_ms") is not None else None,
@@ -184,6 +200,18 @@ class GgufWorkerClient:
             n_tts_tokens=response.get("n_tts_tokens"),
             server_send_ts=time.time(),
         )
+
+    @property
+    def worker_runtime_dir(self) -> Path:
+        return self._worker_runtime_dir
+
+    @property
+    def worker_output_dir(self) -> Path:
+        return self._output_dir
+
+    @property
+    def worker_tts_dir(self) -> Path:
+        return self._tts_wav_dir
 
     def set_break(self) -> None:
         self._request({"type": "break"})
@@ -266,9 +294,59 @@ class GgufWorkerClient:
             if audio_np.ndim == 2:
                 audio_np = audio_np[:, 0]
             chunks.append(audio_np.reshape(-1))
+            wav_index = self._parse_wav_index(Path(wav_path))
+            if wav_index is not None:
+                self._last_loaded_wav_index = max(self._last_loaded_wav_index, wav_index)
         if not chunks:
             return np.zeros((0,), dtype=np.float32)
         return np.concatenate(chunks)
+
+    def _collect_missing_worker_audio_paths(self, *, should_wait: bool, end_of_turn: bool) -> list[str]:
+        if not self._tts_wav_dir.exists():
+            return []
+        deadline = time.monotonic() + (
+            max(0.15, self.config.model.gguf_final_speek_wait_ms / 1000.0)
+            if end_of_turn
+            else max(0.08, self.config.model.gguf_wav_idle_stable_ms / 1000.0)
+        )
+        best_paths = self._scan_new_worker_audio_paths()
+        while should_wait and not best_paths and time.monotonic() < deadline:
+            time.sleep(0.02)
+            best_paths = self._scan_new_worker_audio_paths()
+        return [str(path) for path in best_paths]
+
+    def _merge_audio_paths(self, primary_paths: list[str], fallback_paths: list[str]) -> list[str]:
+        indexed_paths: dict[int, str] = {}
+        unordered_paths: list[str] = []
+        for path_str in [*primary_paths, *fallback_paths]:
+            wav_index = self._parse_wav_index(Path(path_str))
+            if wav_index is None:
+                if path_str not in unordered_paths:
+                    unordered_paths.append(path_str)
+                continue
+            indexed_paths[wav_index] = path_str
+        merged_paths = [indexed_paths[index] for index in sorted(indexed_paths)]
+        merged_paths.extend(unordered_paths)
+        return merged_paths
+
+    def _scan_new_worker_audio_paths(self) -> list[Path]:
+        if not self._tts_wav_dir.exists():
+            return []
+        paths: list[tuple[int, Path]] = []
+        for wav_path in self._tts_wav_dir.glob("wav_*.wav"):
+            wav_index = self._parse_wav_index(wav_path)
+            if wav_index is None or wav_index <= self._last_loaded_wav_index:
+                continue
+            paths.append((wav_index, wav_path))
+        paths.sort(key=lambda item: item[0])
+        return [path for _, path in paths]
+
+    @staticmethod
+    def _parse_wav_index(path: Path) -> int | None:
+        match = re.fullmatch(r"wav_(\d+)\.wav", path.name)
+        if match is None:
+            return None
+        return int(match.group(1))
 
     def _pump_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None

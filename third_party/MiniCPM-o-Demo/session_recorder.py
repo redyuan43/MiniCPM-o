@@ -122,6 +122,36 @@ def _resample_linear(pcm: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _load_worker_tts_audio(tts_dir: str, out_sr: int) -> Optional[np.ndarray]:
+    if not tts_dir or not os.path.isdir(tts_dir):
+        return None
+    wav_entries: List[Tuple[int, str]] = []
+    for name in os.listdir(tts_dir):
+        if not name.startswith("wav_") or not name.endswith(".wav"):
+            continue
+        try:
+            wav_index = int(name[4:-4])
+        except ValueError:
+            continue
+        wav_entries.append((wav_index, os.path.join(tts_dir, name)))
+    if not wav_entries:
+        return None
+    wav_entries.sort(key=lambda item: item[0])
+    chunks: List[np.ndarray] = []
+    for _, wav_path in wav_entries:
+        pcm = _read_wav_mono(wav_path)
+        if pcm is None or len(pcm) == 0:
+            continue
+        with wave.open(wav_path, "rb") as wf:
+            sample_rate = wf.getframerate()
+        if sample_rate != out_sr:
+            pcm = _resample_linear(pcm, sample_rate, out_sr)
+        chunks.append(pcm.astype(np.float32, copy=False))
+    if not chunks:
+        return None
+    return np.concatenate(chunks)
+
+
 def _write_stereo_wav(path: str, left: np.ndarray, right: np.ndarray, sample_rate: int) -> None:
     """写入双声道 16-bit PCM WAV（left=左声道, right=右声道）"""
     n = min(len(left), len(right))
@@ -474,6 +504,24 @@ class DuplexSessionRecorder(SessionRecorder):
                 right[off:off + len(ai_pcm)] += ai_pcm
             self._chunk_logical_sec.append((off / out_sr, (off + n) / out_sr))
             off += n
+
+        total_ai_samples = int(np.count_nonzero(np.abs(right) > 1e-6))
+        worker_tts_dir = str(self.config_snapshot.get("gguf_worker_tts_dir", "") or "").strip()
+        worker_tts_pcm = _load_worker_tts_audio(worker_tts_dir, out_sr)
+        if worker_tts_pcm is not None and (
+            total_ai_samples == 0 or len(worker_tts_pcm) > total_ai_samples * 1.5
+        ):
+            if len(worker_tts_pcm) > total:
+                left = np.pad(left, (0, len(worker_tts_pcm) - total))
+                right = np.pad(right, (0, len(worker_tts_pcm) - total))
+                total = len(worker_tts_pcm)
+            right[:] = 0.0
+            right[: len(worker_tts_pcm)] = worker_tts_pcm[: len(right)]
+            logger.info(
+                "[SessionRecorder] merged replay patched from worker tts dir: %s (%d samples)",
+                worker_tts_dir,
+                len(worker_tts_pcm),
+            )
 
         out_path = os.path.join(self.session_dir, "merged_replay.wav")
         _write_stereo_wav(out_path, left, right, out_sr)
