@@ -55,6 +55,9 @@ class ScenarioStep:
     trigger: str = "immediate"
     trigger_delay_s: float = 0.0
     playback_gain: float = 1.6
+    background_text: str = ""
+    background_gain: float = 0.35
+    background_offset_s: float = 0.0
 
 
 @dataclass(slots=True)
@@ -102,6 +105,33 @@ PROMPTS: list[PromptScenario] = [
         ],
     ),
     PromptScenario(
+        name="audio_multi_turn_chat",
+        mode="omni",
+        audio_only=True,
+        steps=[
+            ScenarioStep(
+                name="turn_1_greeting",
+                prompt_text="你好，请先简单介绍一下你自己。",
+                post_wait_s=8.0,
+            ),
+            ScenarioStep(
+                name="turn_2_followup",
+                prompt_text="那你刚才说过你可以陪我聊天。现在请用一句话重复这个意思。",
+                post_wait_s=8.0,
+            ),
+            ScenarioStep(
+                name="turn_3_memory",
+                prompt_text="我们刚才已经聊过了。请记住前面的话，再问候我一次。",
+                post_wait_s=8.0,
+            ),
+            ScenarioStep(
+                name="turn_4_topic_switch",
+                prompt_text="现在换个话题，请用两句话讲一个很短的小故事。",
+                post_wait_s=12.0,
+            ),
+        ],
+    ),
+    PromptScenario(
         name="audio_story",
         mode="omni",
         audio_only=True,
@@ -112,10 +142,10 @@ PROMPTS: list[PromptScenario] = [
                     "When the user asks for a story, tell a complete short story with multiple sentences "
                     "instead of a one-line reply. Keep the story coherent and finish the sentence before stopping."
                 ),
-                "max_new_speak_tokens_per_chunk": 28,
+                "max_new_speak_tokens_per_chunk": 36,
             },
             "runtime": {
-                "assistant_continuation_grace_chunks": 10,
+                "assistant_continuation_grace_chunks": 14,
             },
         },
         steps=[
@@ -137,7 +167,7 @@ PROMPTS: list[PromptScenario] = [
                     "When asked for a story, tell a complete short story with multiple sentences. "
                     "If the user clearly interrupts while you are speaking, stop quickly and answer the interruption first."
                 ),
-                "max_new_speak_tokens_per_chunk": 28,
+                "max_new_speak_tokens_per_chunk": 36,
             },
             "audio": {
                 "interrupt_rms_threshold": 0.025,
@@ -146,7 +176,7 @@ PROMPTS: list[PromptScenario] = [
                 "interrupt_hold_ms": 70,
             },
             "runtime": {
-                "assistant_continuation_grace_chunks": 10,
+                "assistant_continuation_grace_chunks": 14,
                 "chunk_barge_in_rms_threshold": 0.02,
                 "chunk_barge_in_peak_threshold": 0.12,
                 "chunk_barge_in_consecutive_chunks": 1,
@@ -170,6 +200,119 @@ PROMPTS: list[PromptScenario] = [
                 name="follow_up",
                 prompt_text="现在请继续，再补充一句话。",
                 post_wait_s=8.0,
+            ),
+        ],
+    ),
+    PromptScenario(
+        name="audio_story_multi_interrupt",
+        mode="omni",
+        audio_only=True,
+        config_overrides={
+            "session": {
+                "system_prompt": (
+                    "You are a bilingual robot assistant. Only speak after clear user speech. "
+                    "When asked for a story, tell a complete short story with multiple sentences. "
+                    "If the user clearly interrupts while you are speaking, stop quickly, answer the interruption first, "
+                    "and only continue the story if the user asks you to continue."
+                ),
+                "max_new_speak_tokens_per_chunk": 36,
+            },
+            "audio": {
+                "interrupt_rms_threshold": 0.025,
+                "interrupt_peak_threshold": 0.12,
+                "interrupt_min_playback_ms": 120,
+                "interrupt_hold_ms": 70,
+            },
+            "runtime": {
+                "assistant_continuation_grace_chunks": 14,
+                "chunk_barge_in_rms_threshold": 0.02,
+                "chunk_barge_in_peak_threshold": 0.12,
+                "chunk_barge_in_consecutive_chunks": 1,
+            },
+        },
+        steps=[
+            ScenarioStep(
+                name="story_start",
+                prompt_text="请详细讲一个故事，至少讲五句话，不要只说一句。",
+                post_wait_s=1.0,
+            ),
+            ScenarioStep(
+                name="interrupt_1",
+                prompt_text="停一下，先回答我是谁。",
+                post_wait_s=7.0,
+                trigger="after_assistant_start",
+                trigger_delay_s=0.15,
+                playback_gain=3.0,
+            ),
+            ScenarioStep(
+                name="resume_story",
+                prompt_text="好，现在请继续讲故事。",
+                post_wait_s=2.0,
+            ),
+            ScenarioStep(
+                name="interrupt_2",
+                prompt_text="再停一下，现在请换成一句话总结刚才的故事。",
+                post_wait_s=8.0,
+                trigger="after_assistant_start",
+                trigger_delay_s=0.15,
+                playback_gain=3.0,
+            ),
+        ],
+    ),
+    PromptScenario(
+        name="audio_idle_resume",
+        mode="omni",
+        audio_only=True,
+        steps=[
+            ScenarioStep(
+                name="warmup",
+                prompt_text="你好，请回答我能听见。",
+                post_wait_s=35.0,
+            ),
+            ScenarioStep(
+                name="resume_after_idle",
+                prompt_text="现在已经安静了一会儿。请再回答一次你还能听见。",
+                post_wait_s=10.0,
+            ),
+        ],
+    ),
+    PromptScenario(
+        name="audio_background_interference",
+        mode="omni",
+        audio_only=True,
+        steps=[
+            ScenarioStep(
+                name="background_noise_prompt",
+                prompt_text="请告诉我，现在是否还能听清我的问题。",
+                post_wait_s=10.0,
+                background_text="这是背景人声测试，现在有人在旁边说话，电视也在播放节目。",
+                background_gain=0.32,
+                background_offset_s=0.0,
+            ),
+        ],
+    ),
+    PromptScenario(
+        name="audio_tail_completion",
+        mode="omni",
+        audio_only=True,
+        config_overrides={
+            "session": {
+                "system_prompt": (
+                    "You are a bilingual robot assistant. Only speak after clear user speech. "
+                    "When the user asks you to repeat a sentence exactly, repeat it completely and clearly, "
+                    "including the final words."
+                ),
+                "max_new_speak_tokens_per_chunk": 32,
+            },
+            "runtime": {
+                "assistant_continuation_grace_chunks": 14,
+            },
+        },
+        steps=[
+            ScenarioStep(
+                name="tail_sentence",
+                prompt_text="请完整重复这句话：今天晚上我们一起去公园散步，然后再回家喝热牛奶。",
+                post_wait_s=12.0,
             ),
         ],
     ),
@@ -219,6 +362,38 @@ PROMPTS: list[PromptScenario] = [
                 name="vision_question_repeat",
                 prompt_text="现在还是同一个画面。你又看到了什么？请简短回答主要物体。",
                 post_wait_s=10.0,
+            ),
+        ],
+    ),
+    PromptScenario(
+        name="omni_chat_fixed_scene",
+        mode="omni",
+        audio_only=False,
+        config_overrides={
+            "session": {
+                "system_prompt": (
+                    "You are a bilingual robot assistant. Only speak after clear user speech. "
+                    "Use the latest frame captured at the start of each user question. "
+                    "If the scene is unchanged, keep visual answers consistent across turns."
+                ),
+                "max_new_speak_tokens_per_chunk": 24,
+            },
+        },
+        steps=[
+            ScenarioStep(
+                name="scene_turn_1",
+                prompt_text="你现在看到了什么？请简短回答主要物体。",
+                post_wait_s=8.0,
+            ),
+            ScenarioStep(
+                name="scene_turn_2",
+                prompt_text="我们继续聊同一个画面。你再说一遍你看到了什么。",
+                post_wait_s=8.0,
+            ),
+            ScenarioStep(
+                name="scene_turn_3",
+                prompt_text="如果画面没变，请继续根据同一个画面回答你看到了什么。",
+                post_wait_s=8.0,
             ),
         ],
     ),
@@ -495,6 +670,29 @@ def _write_wav_float32(wav_path: Path, audio: np.ndarray, sample_rate: int) -> N
         fh.writeframes(pcm.tobytes())
 
 
+def _mix_prompt_with_background(
+    *,
+    prompt_wav: Path,
+    background_wav: Path,
+    mixed_wav: Path,
+    background_gain: float,
+    background_offset_s: float,
+) -> Path:
+    prompt_audio, prompt_rate = _read_wav_float32(prompt_wav)
+    background_audio, background_rate = _read_wav_float32(background_wav)
+    if prompt_rate != background_rate:
+        raise RuntimeError(
+            f"Prompt/background sample rate mismatch: {prompt_rate} vs {background_rate}"
+        )
+    offset_samples = max(0, int(background_offset_s * prompt_rate))
+    total_len = max(len(prompt_audio), offset_samples + len(background_audio))
+    mixed = np.zeros(total_len, dtype=np.float32)
+    mixed[: len(prompt_audio)] += prompt_audio
+    mixed[offset_samples:offset_samples + len(background_audio)] += background_audio * background_gain
+    _write_wav_float32(mixed_wav, mixed, prompt_rate)
+    return mixed_wav
+
+
 def _play_wav(wav_path: Path, device_selector: str, gain: float = 1.6) -> None:
     ensure_sounddevice_available()
     device_id, _device_info, _label = resolve_playback_device(device_selector)
@@ -662,6 +860,46 @@ def _score_result(
         and ("interrupt" not in scenario.name or int(summary.get("barge_in_count", 0)) >= 1)
         and ("stability" not in scenario.name or (turns >= 2 and assistant_turn_stability >= 0.35))
     )
+    if scenario.name == "audio_multi_turn_chat":
+        passed = bool(
+            assistant_text
+            and turns >= 3
+            and assistant_similarity >= 0.45
+            and prompt_similarity >= 0.8
+        )
+    elif scenario.name == "audio_story_multi_interrupt":
+        passed = bool(
+            assistant_text
+            and assistant_similarity >= 0.5
+            and tail_similarity >= 0.45
+            and int(summary.get("barge_in_count", 0)) >= 2
+        )
+    elif scenario.name == "audio_idle_resume":
+        passed = bool(
+            assistant_text
+            and turns >= 2
+            and assistant_similarity >= 0.45
+            and prompt_similarity >= 0.8
+        )
+    elif scenario.name == "audio_background_interference":
+        passed = bool(
+            assistant_text
+            and prompt_similarity >= 0.45
+            and assistant_similarity >= 0.45
+        )
+    elif scenario.name == "audio_tail_completion":
+        passed = bool(
+            assistant_text
+            and assistant_similarity >= 0.65
+            and tail_similarity >= 0.75
+        )
+    elif scenario.name == "omni_chat_fixed_scene":
+        passed = bool(
+            assistant_text
+            and turns >= 3
+            and assistant_similarity >= 0.45
+            and assistant_turn_stability >= 0.25
+        )
     return ScenarioResult(
         scenario=scenario.name,
         session_dir=str(session_dir),
@@ -768,13 +1006,25 @@ def _run_single_scenario(
             prompt_wav = prompt_dir / f"{scenario.name}_{index:02d}_{step.name}.wav"
             mic_wav = mic_dir / f"{scenario.name}_{index:02d}_{step.name}.wav"
             _generate_prompt_wav(step.prompt_text, prompt_wav)
+            playback_wav = prompt_wav
+            if step.background_text:
+                background_wav = prompt_dir / f"{scenario.name}_{index:02d}_{step.name}.background.wav"
+                mixed_wav = prompt_dir / f"{scenario.name}_{index:02d}_{step.name}.mixed.wav"
+                _generate_prompt_wav(step.background_text, background_wav)
+                playback_wav = _mix_prompt_with_background(
+                    prompt_wav=prompt_wav,
+                    background_wav=background_wav,
+                    mixed_wav=mixed_wav,
+                    background_gain=step.background_gain,
+                    background_offset_s=step.background_offset_s,
+                )
             assistant_started = False
             if step.trigger == "after_assistant_start":
                 assistant_started = _wait_for_assistant_start(session_dir, assistant_count)
                 if step.trigger_delay_s > 0:
                     time.sleep(step.trigger_delay_s)
             _record_and_play_prompt(
-                prompt_wav=prompt_wav,
+                prompt_wav=playback_wav,
                 mic_wav=mic_wav,
                 capture_device=capture_device,
                 playback_device=playback_device,
@@ -924,7 +1174,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tune", action="store_true", help="Run the small parameter search instead of a single baseline test")
     parser.add_argument(
         "--scenario",
-        choices=("audio_short", "audio_story", "audio_story_interrupt", "omni_short", "omni_scene_stability", "all"),
+        choices=(
+            "audio_short",
+            "audio_multi_turn_chat",
+            "audio_story",
+            "audio_story_interrupt",
+            "audio_story_multi_interrupt",
+            "audio_idle_resume",
+            "audio_background_interference",
+            "audio_tail_completion",
+            "omni_short",
+            "omni_scene_stability",
+            "omni_chat_fixed_scene",
+            "all",
+        ),
         default="all",
         help="Limit self-test to a specific scenario",
     )

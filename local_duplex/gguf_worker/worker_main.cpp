@@ -39,6 +39,7 @@ struct WorkerState {
     int trailing_wait_ms = 150;
     int trailing_idle_stable_ms = 60;
     int final_speek_wait_ms = 900;
+    int pending_tail_scan_chunks = 0;
     bool initialized = false;
     bool prepared = false;
 };
@@ -160,7 +161,7 @@ WavCollectResult collect_generate_wavs(
         state.wav_idle_stable_ms,
         state.wav_empty_wait_ms
     );
-    if (!end_of_turn || wav_result.paths.empty()) {
+    if (!end_of_turn) {
         return {
             std::move(wav_result.paths),
             wav_result.waited_ms,
@@ -168,7 +169,10 @@ WavCollectResult collect_generate_wavs(
         };
     }
 
-    // The final token2wav flush can land slightly after the normal stable window.
+    // The final token2wav flush can land slightly after the normal stable window,
+    // and the last tiny chunk may not produce a wav during the first scan at all.
+    // Always run one extra trailing scan for end-of-turn so the last syllables are
+    // not dropped when the final wav lands a bit later.
     auto trailing_result = wait_for_new_wavs(
         state.base_output_dir,
         state.last_seen_wav_index,
@@ -392,14 +396,27 @@ json handle_generate(WorkerState & state, const json & req) {
     bool end_of_turn = false;
     std::string text;
     drain_text_queue(state.ctx, is_listen, end_of_turn, text);
+    const bool followup_tail_scan =
+        !end_of_turn && is_listen && text.empty() && state.pending_tail_scan_chunks > 0;
     const int final_speek_wait_ms = (end_of_turn && state.ctx != nullptr && !state.ctx->speek_done)
         ? wait_for_speek_done(state)
         : 0;
     const bool should_collect_wavs =
-        !is_listen || end_of_turn || !text.empty();
+        !is_listen || end_of_turn || !text.empty() || followup_tail_scan;
     const auto wav_result = should_collect_wavs
-        ? collect_generate_wavs(state, end_of_turn)
+        ? collect_generate_wavs(state, end_of_turn || followup_tail_scan)
         : WavCollectResult{};
+    if (end_of_turn) {
+        state.pending_tail_scan_chunks = 2;
+    } else if (followup_tail_scan) {
+        if (!wav_result.paths.empty()) {
+            state.pending_tail_scan_chunks = 0;
+        } else if (state.pending_tail_scan_chunks > 0) {
+            state.pending_tail_scan_chunks -= 1;
+        }
+    } else if (!is_listen) {
+        state.pending_tail_scan_chunks = 0;
+    }
     const int used_chunk_index = state.chunk_index;
     state.chunk_index += 1;
     const auto cost_all_ms = decode_ms + final_speek_wait_ms + wav_result.wav_wait_ms + wav_result.trailing_wait_ms;

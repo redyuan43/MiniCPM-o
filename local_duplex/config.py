@@ -151,9 +151,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "gguf_wav_wait_ms": 800,
         "gguf_wav_idle_stable_ms": 70,
         "gguf_wav_empty_wait_ms": 220,
-        "gguf_trailing_wait_ms": 260,
-        "gguf_trailing_idle_stable_ms": 80,
-        "gguf_final_speek_wait_ms": 900,
+        "gguf_trailing_wait_ms": 320,
+        "gguf_trailing_idle_stable_ms": 100,
+        "gguf_final_speek_wait_ms": 1100,
         "attn_implementation": "sdpa",
         "device": "cuda",
         "device_index": 0,
@@ -191,11 +191,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "You are a bilingual robot assistant. Only speak after clear user speech. "
             "Keep simple confirmations short, but when the user asks for an explanation, story, "
             "or a longer answer, respond naturally and finish the requested sentence or story. "
+            "When asked for a story, answer with at least three complete sentences unless interrupted. "
             "Stay interruptible, but do not stop speaking unless the user clearly interrupts. "
             "Do not proactively start talking when the user is silent."
         ),
         "force_listen_count": 3,
-        "max_new_speak_tokens_per_chunk": 24,
+        "max_new_speak_tokens_per_chunk": 28,
         "temperature": 0.7,
         "top_k": 20,
         "top_p": 0.8,
@@ -224,7 +225,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "playback_start_buffer_ms": 1000,
         "playback_start_buffer_chunks": 1,
         "playback_immediate_start_min_ms": 600,
-        "assistant_continuation_grace_chunks": 8,
+        "assistant_continuation_grace_chunks": 12,
         "idle_kv_cleanup_after_ms": 15000,
         "chunk_barge_in_rms_threshold": 0.024,
         "chunk_barge_in_peak_threshold": 0.14,
