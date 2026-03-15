@@ -57,6 +57,8 @@ def print_structured_summary(summary: dict) -> None:
     print(f"  Speak chunks:             {summary.get('speak_chunks', 0)}")
     print(f"  Session resets:           {summary.get('reset_count', 0)}")
     print(f"  Interrupts:               {summary.get('barge_in_count', 0)}")
+    print(f"  Raw interrupts:           {summary.get('barge_in_raw_count', summary.get('barge_in_count', 0))}")
+    print(f"  Confirmation overlaps:    {summary.get('barge_in_confirmation_count', 0)}")
     print(f"  Vision frames sent:       {summary.get('vision_chunks', 0)}")
     print()
 
@@ -84,10 +86,11 @@ def print_structured_summary(summary: dict) -> None:
             )
         elif event.get("kind") == "assistant":
             stop_reasons = ",".join(event.get("stop_reasons", []))
+            turn_role = event.get("turn_role", "normal_reply")
             print(
                 f"  {time_part}  << [Model speaking] \"{event.get('text', '')}\" "
                 f"({event.get('chunk_end', 0) - event.get('chunk_start', 0) + 1} chunks, "
-                f"avg_lat={event.get('avg_latency_ms', 0.0):.0f}ms, stop_reason={stop_reasons})"
+                f"avg_lat={event.get('avg_latency_ms', 0.0):.0f}ms, turn_role={turn_role}, stop_reason={stop_reasons})"
             )
         else:
             print(f"  {time_part}  -- {event.get('message', '')}")

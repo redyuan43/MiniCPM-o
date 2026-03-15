@@ -54,6 +54,7 @@ class ScenarioStep:
     post_wait_s: float
     trigger: str = "immediate"
     trigger_delay_s: float = 0.0
+    trigger_playback_active_ms: float | None = None
     playback_gain: float = 1.6
     background_text: str = ""
     background_gain: float = 0.35
@@ -86,6 +87,8 @@ class ScenarioResult:
     turns: int
     assistant_turn_stability: float
     barge_in_count: int
+    barge_in_raw_count: int
+    barge_in_confirmation_count: int
     passed: bool
     steps: list[dict[str, Any]]
     metrics: dict[str, Any]
@@ -256,6 +259,58 @@ PROMPTS: list[PromptScenario] = [
                 trigger="after_assistant_start",
                 trigger_delay_s=0.15,
                 playback_gain=3.0,
+            ),
+        ],
+    ),
+    PromptScenario(
+        name="audio_ordered_steps_interrupt_resume",
+        mode="omni",
+        audio_only=True,
+        config_overrides={
+            "session": {
+                "system_prompt": (
+                    "You are a bilingual robot assistant. Only speak after clear user speech. "
+                    "When the user asks for ordered steps, keep the exact order and keep each step complete. "
+                    "If the user interrupts you, stop quickly, give a very short acknowledgement, "
+                    "and when asked to continue, resume from the first unfinished step instead of restarting from step one."
+                ),
+                "max_new_speak_tokens_per_chunk": 36,
+            },
+            "audio": {
+                "interrupt_rms_threshold": 0.025,
+                "interrupt_peak_threshold": 0.12,
+                "interrupt_min_playback_ms": 120,
+                "interrupt_hold_ms": 70,
+            },
+            "runtime": {
+                "assistant_continuation_grace_chunks": 14,
+                "chunk_barge_in_rms_threshold": 0.02,
+                "chunk_barge_in_peak_threshold": 0.12,
+                "chunk_barge_in_consecutive_chunks": 1,
+            },
+        },
+        steps=[
+            ScenarioStep(
+                name="ordered_steps",
+                prompt_text=(
+                    "请按顺序完整说出五个步骤：第一步先洗杯子，第二步放茶叶，第三步倒热水，"
+                    "第四步等一分钟，第五步慢慢喝。每一步都要说完整，不要跳步，不要换顺序。"
+                ),
+                post_wait_s=1.0,
+            ),
+            ScenarioStep(
+                name="interrupt_ack",
+                prompt_text="停，先只回答我：收到。",
+                post_wait_s=4.0,
+                trigger="after_assistant_start",
+                trigger_delay_s=0.15,
+                trigger_playback_active_ms=2200,
+                playback_gain=3.0,
+            ),
+            ScenarioStep(
+                name="resume_unfinished_steps",
+                prompt_text="现在从刚才没说完的步骤继续，不要从头开始。",
+                post_wait_s=10.0,
             ),
         ],
     ),
@@ -777,6 +832,42 @@ def _load_summary(summary_path: Path) -> dict[str, Any]:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
+def _collect_step_assistant_texts(session_dir: Path, step_artifacts: list[dict[str, Any]]) -> list[str]:
+    responses = [""] * len(step_artifacts)
+    jsonl_path = session_dir / "interaction.jsonl"
+    if not jsonl_path.exists():
+        return responses
+
+    chunk_events = [
+        json.loads(line)
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    prompt_start_chunks = [int(artifact.get("prompt_start_chunk_index", -1)) for artifact in step_artifacts]
+    for index, start_chunk in enumerate(prompt_start_chunks):
+        next_start_chunk = prompt_start_chunks[index + 1] if index + 1 < len(prompt_start_chunks) else None
+        texts: list[str] = []
+        for event in chunk_events:
+            if event.get("type") != "chunk":
+                continue
+            chunk_index = int(event.get("chunk_index", -1))
+            if chunk_index <= start_chunk:
+                continue
+            if next_start_chunk is not None and chunk_index >= next_start_chunk:
+                continue
+            if event.get("assistant", {}).get("state") != "speak":
+                continue
+            text = str(event.get("assistant", {}).get("text", "") or "").strip()
+            if text:
+                texts.append(text)
+        responses[index] = " ".join(texts).strip()
+    return responses
+
+
+def _count_keyword_hits(text: str, keywords: list[str]) -> int:
+    return sum(1 for keyword in keywords if keyword in text)
+
+
 def _scenario_report_path(run_dir: Path, scenario: str) -> Path:
     return run_dir / "reports" / f"{scenario}.json"
 
@@ -791,11 +882,12 @@ def _score_result(
     summary = _load_summary(summary_path)
     assistant_text, turns, speak_latency_ms = _collect_assistant_text(summary_path)
     assistant_turn_stability = _assistant_turn_stability(summary)
+    step_assistant_texts = _collect_step_assistant_texts(session_dir, step_artifacts)
 
     step_results: list[dict[str, Any]] = []
     prompt_scores: list[float] = []
     prompt_transcripts: list[str] = []
-    for artifact in step_artifacts:
+    for index, artifact in enumerate(step_artifacts):
         mic_asr = _transcribe_wav_with_capswriter(Path(artifact["mic_wav"]))
         prompt_similarity = _similarity(artifact["prompt_text"], mic_asr.get("text", ""))
         prompt_scores.append(prompt_similarity)
@@ -808,6 +900,7 @@ def _score_result(
                 "prompt_similarity": round(prompt_similarity, 4),
                 "trigger": artifact["trigger"],
                 "assistant_started_before_trigger": artifact["assistant_started_before_trigger"],
+                "assistant_response_text": step_assistant_texts[index] if index < len(step_assistant_texts) else "",
             }
         )
 
@@ -873,6 +966,14 @@ def _score_result(
             and assistant_similarity >= 0.45
             and assistant_turn_stability >= 0.25
         )
+    elif scenario.name == "audio_ordered_steps_interrupt_resume":
+        passed = bool(
+            assistant_text
+            and int(summary.get("barge_in_count", 0)) >= 1
+            and assistant_similarity >= 0.40
+            and tail_similarity >= 0.40
+            and _score_ordered_resume_step_responses(step_assistant_texts)
+        )
     return ScenarioResult(
         scenario=scenario.name,
         session_dir=str(session_dir),
@@ -889,11 +990,14 @@ def _score_result(
         turns=turns,
         assistant_turn_stability=round(assistant_turn_stability, 4),
         barge_in_count=int(summary.get("barge_in_count", 0)),
+        barge_in_raw_count=int(summary.get("barge_in_raw_count", summary.get("barge_in_count", 0))),
+        barge_in_confirmation_count=int(summary.get("barge_in_confirmation_count", 0)),
         passed=passed,
         steps=step_results,
         metrics={
             "summary": summary,
             "assistant_asr": playback_asr,
+            "step_assistant_texts": step_assistant_texts,
         },
     )
 
@@ -944,13 +1048,64 @@ def _count_assistant_chunks(session_dir: Path) -> int:
     return count
 
 
-def _wait_for_assistant_start(session_dir: Path, baseline_count: int, timeout_s: float = 25.0) -> bool:
+def _latest_chunk_event(session_dir: Path) -> dict[str, Any] | None:
+    jsonl_path = session_dir / "interaction.jsonl"
+    if not jsonl_path.exists():
+        return None
+    for line in reversed(jsonl_path.read_text(encoding="utf-8").splitlines()):
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event.get("type") == "chunk":
+            return event
+    return None
+
+
+def _latest_chunk_index(session_dir: Path) -> int:
+    latest_chunk = _latest_chunk_event(session_dir)
+    if latest_chunk is None:
+        return -1
+    return int(latest_chunk.get("chunk_index", -1))
+
+
+def _wait_for_assistant_start(
+    session_dir: Path,
+    baseline_count: int,
+    timeout_s: float = 25.0,
+    trigger_playback_active_ms: float | None = None,
+) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _count_assistant_chunks(session_dir) > baseline_count:
-            return True
+            if trigger_playback_active_ms is None:
+                return True
+            latest_chunk = _latest_chunk_event(session_dir)
+            if (
+                latest_chunk is not None
+                and latest_chunk.get("assistant", {}).get("state") == "speak"
+                and latest_chunk.get("input", {}).get("playback_active")
+                and float(latest_chunk.get("input", {}).get("playback_active_ms", 0.0)) >= trigger_playback_active_ms
+            ):
+                return True
         time.sleep(0.2)
     return False
+
+
+def _score_ordered_resume_step_responses(step_responses: list[str]) -> bool:
+    if len(step_responses) < 3:
+        return False
+    first_response = step_responses[0]
+    ack_response = step_responses[1]
+    resume_response = step_responses[2]
+    ack_keywords = ["收到", "好的", "先停一下", "我停一下"]
+    resumed_steps = ["第三步", "第四步", "第五步"]
+    return bool(
+        "第一步" in first_response
+        and any(keyword in first_response for keyword in ("第二步", "第三步"))
+        and any(keyword in ack_response for keyword in ack_keywords)
+        and _count_keyword_hits(resume_response, resumed_steps) >= 2
+        and "第一步" not in resume_response
+    )
 
 
 def _run_single_scenario(
@@ -993,9 +1148,14 @@ def _run_single_scenario(
                 )
             assistant_started = False
             if step.trigger == "after_assistant_start":
-                assistant_started = _wait_for_assistant_start(session_dir, assistant_count)
+                assistant_started = _wait_for_assistant_start(
+                    session_dir,
+                    assistant_count,
+                    trigger_playback_active_ms=step.trigger_playback_active_ms,
+                )
                 if step.trigger_delay_s > 0:
                     time.sleep(step.trigger_delay_s)
+            prompt_start_chunk_index = _latest_chunk_index(session_dir)
             _record_and_play_prompt(
                 prompt_wav=playback_wav,
                 mic_wav=mic_wav,
@@ -1011,6 +1171,7 @@ def _run_single_scenario(
                     "mic_wav": str(mic_wav),
                     "trigger": step.trigger,
                     "assistant_started_before_trigger": assistant_started,
+                    "prompt_start_chunk_index": prompt_start_chunk_index,
                 }
             )
             time.sleep(step.post_wait_s)
@@ -1027,7 +1188,7 @@ def _run_single_scenario(
     return result
 
 
-def _candidate_score(results: list[ScenarioResult]) -> tuple[float, float, float, float, float]:
+def _candidate_score(results: list[ScenarioResult]) -> tuple[float, float, float, float, float, float]:
     tail = sum(item.tail_similarity for item in results) / len(results)
     assist = sum(item.assistant_similarity for item in results) / len(results)
     prompt = sum(item.prompt_similarity for item in results) / len(results)
@@ -1038,12 +1199,17 @@ def _candidate_score(results: list[ScenarioResult]) -> tuple[float, float, float
         if interrupt_items
         else 0.0
     )
-    interrupt_excess_penalty = (
-        -sum(max(0, item.barge_in_count - 4) for item in interrupt_items) / len(interrupt_items)
+    interrupt_confirmation_penalty = (
+        -sum(item.barge_in_confirmation_count for item in interrupt_items) / (4.0 * len(interrupt_items))
         if interrupt_items
         else 0.0
     )
-    return (interrupt_hit, interrupt_excess_penalty, tail, assist, prompt - (latency / 10000.0))
+    interrupt_excess_penalty = (
+        -sum(max(0, item.barge_in_raw_count - 4) for item in interrupt_items) / len(interrupt_items)
+        if interrupt_items
+        else 0.0
+    )
+    return (interrupt_hit, interrupt_confirmation_penalty, interrupt_excess_penalty, tail, assist, prompt - (latency / 10000.0))
 
 
 def _render_final_summary(
@@ -1077,6 +1243,8 @@ def _render_final_summary(
                 f"- speak_latency_ms: `{result.speak_latency_ms}`",
                 f"- assistant_turn_stability: `{result.assistant_turn_stability}`",
                 f"- barge_in_count: `{result.barge_in_count}`",
+                f"- barge_in_raw_count: `{result.barge_in_raw_count}`",
+                f"- barge_in_confirmation_count: `{result.barge_in_confirmation_count}`",
                 f"- passed: `{result.passed}`",
                 f"- assistant_text: `{result.assistant_text}`",
                 f"- assistant_transcript: `{result.assistant_transcript}`",
@@ -1091,6 +1259,7 @@ def _render_final_summary(
                         f"- `{step['name']}` trigger=`{step['trigger']}` prompt_similarity=`{step['prompt_similarity']}` assistant_started_before_trigger=`{step['assistant_started_before_trigger']}`",
                         f"  prompt_text: `{step['prompt_text']}`",
                         f"  prompt_transcript: `{step['prompt_transcript']}`",
+                        f"  assistant_response_text: `{step.get('assistant_response_text', '')}`",
                     ]
                 )
             lines.append("")
@@ -1111,7 +1280,7 @@ def _run_search(
     candidates = TUNING_CANDIDATES if tune else [TUNING_CANDIDATES[0]]
     best_overrides = candidates[0]
     best_results: list[ScenarioResult] = []
-    best_score: tuple[float, float, float, float] | None = None
+    best_score: tuple[float, float, float, float, float, float] | None = None
 
     for index, overrides in enumerate(candidates):
         candidate_dir = run_dir / f"candidate_{index:02d}"
@@ -1146,6 +1315,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "audio_story",
             "audio_story_interrupt",
             "audio_story_multi_interrupt",
+            "audio_ordered_steps_interrupt_resume",
             "audio_idle_resume",
             "audio_background_interference",
             "audio_tail_completion",

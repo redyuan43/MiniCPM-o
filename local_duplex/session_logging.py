@@ -64,6 +64,9 @@ class InteractionSessionLogger:
         audio_peak: float,
         playback_active_ms: float,
         playback_remaining_ms: float,
+        barge_in_kind: str,
+        barge_in_group_id: int,
+        assistant_turn_role: str,
     ) -> None:
         self._append_event(
             {
@@ -75,6 +78,9 @@ class InteractionSessionLogger:
                 "audio_peak": round(audio_peak, 4),
                 "playback_active_ms": round(playback_active_ms, 1),
                 "playback_remaining_ms": round(playback_remaining_ms, 1),
+                "barge_in_kind": barge_in_kind,
+                "barge_in_group_id": barge_in_group_id,
+                "assistant_turn_role": assistant_turn_role,
             }
         )
         self._rewrite_outputs()
@@ -130,6 +136,8 @@ class InteractionSessionLogger:
         model_decision_bias: str,
         unsolicited_speak_suppressed: bool,
         unsolicited_speak_suppressed_count: int,
+        assistant_turn_role: str,
+        interrupt_group_id: int | None,
     ) -> None:
         user_frame_rel = self._save_frame(chunk_index, frame) if vision_used and frame is not None else None
         ai_audio_rel, ai_audio_duration_ms = self._save_ai_audio(chunk_index, result)
@@ -180,6 +188,8 @@ class InteractionSessionLogger:
                 ),
                 "ended_with_listen": bool(getattr(result, "ended_with_listen", False)),
                 "stop_reason": str(getattr(result, "stop_reason", "") or "empty"),
+                "turn_role": assistant_turn_role,
+                "interrupt_group_id": interrupt_group_id,
                 "audio_path": ai_audio_rel,
                 "audio_duration_ms": ai_audio_duration_ms,
             },
@@ -330,6 +340,8 @@ class InteractionSessionLogger:
         over_budget = [event for event in speak_events if event["performance"]["over_budget"]]
         vision_used_count = sum(1 for event in chunk_events if event["vision"]["used"])
         barge_ins = [event for event in system_events if event["event"] == "barge_in"]
+        effective_barge_ins = [event for event in barge_ins if event.get("barge_in_kind") == "effective_interrupt"]
+        confirmation_overlaps = [event for event in barge_ins if event.get("barge_in_kind") == "confirmation_overlap"]
         resets = [event for event in system_events if event["event"] == "session_reset"]
         health_changes = [event for event in system_events if event["event"] == "health_change"]
         first_speak_event = speak_events[0] if speak_events else None
@@ -361,7 +373,9 @@ class InteractionSessionLogger:
             "listen_chunks": len(listen_events),
             "speak_chunks": len(speak_events),
             "vision_chunks": vision_used_count,
-            "barge_in_count": len(barge_ins),
+            "barge_in_count": len(effective_barge_ins),
+            "barge_in_raw_count": len(barge_ins),
+            "barge_in_confirmation_count": len(confirmation_overlaps),
             "reset_count": len(resets),
             "consistency_error_count": consistency_error_count,
             "kv_reset_count": kv_reset_count,
@@ -392,7 +406,8 @@ class InteractionSessionLogger:
             "likely_stutter_causes": self._build_stutter_causes(
                 over_budget_count=len(over_budget),
                 fragmented_count=len(fragmented),
-                barge_in_count=len(barge_ins),
+                barge_in_count=len(effective_barge_ins),
+                barge_in_confirmation_count=len(confirmation_overlaps),
                 consistency_error_count=consistency_error_count,
                 kv_reset_count=kv_reset_count,
                 stuck_listen_count=stuck_listen_count,
@@ -441,6 +456,8 @@ class InteractionSessionLogger:
                     "audio_duration_ms": sum(event["assistant"]["audio_duration_ms"] for event in assistant_segment),
                     "vision_used": any(event["vision"]["used"] for event in assistant_segment),
                     "fragmented": any(event["analysis"]["fragmented_speech"] for event in assistant_segment),
+                    "turn_role": assistant_segment[0]["assistant"].get("turn_role", "normal_reply"),
+                    "interrupt_group_id": assistant_segment[0]["assistant"].get("interrupt_group_id"),
                     "stop_reasons": [event["assistant"]["stop_reason"] for event in assistant_segment],
                 }
             )
@@ -462,7 +479,10 @@ class InteractionSessionLogger:
 
         for event in system_events:
             if event["event"] == "barge_in":
-                message = "Barge-in detected during playback"
+                if event.get("barge_in_kind") == "confirmation_overlap":
+                    message = "Confirmation overlap during interrupt acknowledgement"
+                else:
+                    message = "Barge-in detected during playback"
                 flow.append(
                     {
                         "kind": "system",
@@ -496,6 +516,7 @@ class InteractionSessionLogger:
         over_budget_count: int,
         fragmented_count: int,
         barge_in_count: int,
+        barge_in_confirmation_count: int,
         consistency_error_count: int,
         kv_reset_count: int,
         stuck_listen_count: int,
@@ -503,6 +524,8 @@ class InteractionSessionLogger:
         causes: list[str] = []
         if barge_in_count:
             causes.append(f"{barge_in_count} barge-in events interrupted playback")
+        if barge_in_confirmation_count:
+            causes.append(f"{barge_in_confirmation_count} confirmation overlaps were grouped into interrupt acknowledgements")
         if over_budget_count:
             causes.append(
                 f"{over_budget_count} speak chunks exceeded the {self.config.runtime.speak_latency_budget_ms}ms speak budget"
@@ -539,6 +562,8 @@ class InteractionSessionLogger:
             f"- Session resets: `{summary['reset_count']}`",
             f"- Session health: `{summary['last_session_health']}`",
             f"- Barge-ins: `{summary['barge_in_count']}`",
+            f"- Raw barge-ins: `{summary['barge_in_raw_count']}`",
+            f"- Confirmation overlaps: `{summary['barge_in_confirmation_count']}`",
             f"- Consistency errors: `{summary['consistency_error_count']}`",
             f"- KV resets: `{summary['kv_reset_count']}`",
             f"- Stuck-listen recoveries: `{summary['stuck_listen_count']}`",
@@ -585,6 +610,7 @@ class InteractionSessionLogger:
                         f"(chunks {event['chunk_start']}-{event['chunk_end']}, "
                         f"avg_latency={self._format_number(event['avg_latency_ms'])} ms, "
                         f"audio={self._format_number(event['audio_duration_ms'])} ms, "
+                        f"turn_role={event.get('turn_role', 'normal_reply')}, "
                         f"vision={'used' if event['vision_used'] else 'not used'}, "
                         f"fragmented={'yes' if event['fragmented'] else 'no'}, "
                         f"stop_reason={','.join(event['stop_reasons'])})"

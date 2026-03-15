@@ -93,6 +93,12 @@ class LocalDuplexRunner:
         self._barge_in_latched = False
         self._barge_in_listen_lock = False
         self._barge_in_release_silent_chunks_remaining = 0
+        self._barge_in_group_seq = 0
+        self._active_interrupt_group_id: int | None = None
+        self._pending_interrupt_ack = False
+        self._pending_interrupt_user_segment_seen = False
+        self._current_assistant_turn_role = "normal_reply"
+        self._current_assistant_interrupt_group_id: int | None = None
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
@@ -157,6 +163,7 @@ class LocalDuplexRunner:
                     playback_active=playback_active,
                     barge_in_detected=barge_in_detected,
                 )
+                previous_user_turn_active = self._user_turn_active
                 barge_in_listen_lock_active = self._update_barge_in_listen_lock(
                     playback_active=playback_active,
                     speech_detected=speech_detected,
@@ -169,7 +176,12 @@ class LocalDuplexRunner:
                     speech_activation_window_open=speech_activation_window_open,
                     playback_active=playback_active,
                 )
+                self._after_user_turn_state_update(
+                    previous_user_turn_active=previous_user_turn_active,
+                    playback_active=playback_active,
+                )
                 if barge_in_detected:
+                    barge_in_kind, barge_in_group_id = self._classify_barge_in()
                     self._barge_in_latched = True
                     self._barge_in_listen_lock = True
                     self._barge_in_release_silent_chunks_remaining = POST_BARGE_IN_RELEASE_SILENT_CHUNKS
@@ -187,6 +199,9 @@ class LocalDuplexRunner:
                             audio_peak=audio_peak,
                             playback_active_ms=playback_active_ms,
                             playback_remaining_ms=playback_remaining_ms,
+                            barge_in_kind=barge_in_kind,
+                            barge_in_group_id=barge_in_group_id,
+                            assistant_turn_role=self._current_assistant_turn_role,
                         )
 
                 frame = None
@@ -271,6 +286,7 @@ class LocalDuplexRunner:
                     )
                     backend_end_of_turn = False
                     stop_reason = "barge_in_suppressed"
+                assistant_turn_role, interrupt_group_id = self._current_assistant_turn_metadata(result)
 
                 if result.is_listen:
                     if result.audio_data:
@@ -296,6 +312,12 @@ class LocalDuplexRunner:
                 if speech_detected or playback_active:
                     self._last_interaction_monotonic = time.monotonic()
                 self._update_assistant_turn_state(result)
+                self._after_assistant_turn_state_update(
+                    result=result,
+                    assistant_turn_role=assistant_turn_role,
+                    interrupt_group_id=interrupt_group_id,
+                    backend_end_of_turn=backend_end_of_turn,
+                )
 
                 reset_reason = self._after_chunk(
                     chunk_index=chunk_index,
@@ -330,6 +352,8 @@ class LocalDuplexRunner:
                         model_decision_bias=model_decision_bias,
                         unsolicited_speak_suppressed=unsolicited_speak_suppressed,
                         unsolicited_speak_suppressed_count=self._session_unsolicited_speak_suppressed_count,
+                        assistant_turn_role=assistant_turn_role,
+                        interrupt_group_id=interrupt_group_id,
                     )
 
                 chunk_index += 1
@@ -540,6 +564,12 @@ class LocalDuplexRunner:
         self._barge_in_latched = False
         self._barge_in_listen_lock = False
         self._barge_in_release_silent_chunks_remaining = 0
+        self._barge_in_group_seq = 0
+        self._active_interrupt_group_id = None
+        self._pending_interrupt_ack = False
+        self._pending_interrupt_user_segment_seen = False
+        self._current_assistant_turn_role = "normal_reply"
+        self._current_assistant_interrupt_group_id = None
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
@@ -686,6 +716,42 @@ class LocalDuplexRunner:
         self._last_model_decision_bias = "barge_in_listen_lock"
         return result
 
+    def _current_assistant_turn_metadata(self, result) -> tuple[str, int | None]:
+        if not result.is_listen and not self._assistant_turn_open:
+            if self._pending_interrupt_ack and self._active_interrupt_group_id is not None:
+                if self._looks_like_interrupt_ack(result.text or ""):
+                    self._current_assistant_turn_role = "interrupt_ack"
+                    self._current_assistant_interrupt_group_id = self._active_interrupt_group_id
+                    self._pending_interrupt_ack = False
+                else:
+                    self._close_interrupt_episode()
+                    self._current_assistant_turn_role = "normal_reply"
+                    self._current_assistant_interrupt_group_id = None
+            else:
+                self._current_assistant_turn_role = "normal_reply"
+                self._current_assistant_interrupt_group_id = None
+
+        if result.is_listen and not self._assistant_turn_open:
+            if self._pending_interrupt_ack and self._active_interrupt_group_id is not None:
+                return "interrupt_ack", self._active_interrupt_group_id
+            return "normal_reply", None
+
+        return self._current_assistant_turn_role, self._current_assistant_interrupt_group_id
+
+    def _after_assistant_turn_state_update(
+        self,
+        *,
+        result,
+        assistant_turn_role: str,
+        interrupt_group_id: int | None,
+        backend_end_of_turn: bool,
+    ) -> None:
+        del result, backend_end_of_turn
+        if assistant_turn_role == "interrupt_ack" and interrupt_group_id is not None:
+            self._current_assistant_turn_role = "interrupt_ack"
+            self._current_assistant_interrupt_group_id = interrupt_group_id
+        self._maybe_close_interrupt_episode(playback_active=self.playback.active)
+
     def _update_assistant_turn_state(self, result) -> None:
         backend_end_of_turn = self._result_backend_end_of_turn(result)
         stop_reason = self._result_stop_reason(result)
@@ -774,6 +840,78 @@ class LocalDuplexRunner:
     def _close_assistant_turn(self) -> None:
         self._assistant_turn_open = False
         self._assistant_continuation_grace_remaining = 0
+
+    @staticmethod
+    def _looks_like_interrupt_ack(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized or len(normalized) > 20:
+            return False
+        ack_keywords = (
+            "收到",
+            "好的",
+            "好，我",
+            "我停一下",
+            "先停一下",
+            "明白",
+            "知道了",
+            "先回答",
+        )
+        return any(keyword in normalized for keyword in ack_keywords)
+
+    def _classify_barge_in(self) -> tuple[str, int]:
+        if self._active_interrupt_group_id is not None and (
+            self._pending_interrupt_ack or self._current_assistant_turn_role == "interrupt_ack"
+        ):
+            return "confirmation_overlap", self._active_interrupt_group_id
+
+        self._barge_in_group_seq += 1
+        self._active_interrupt_group_id = self._barge_in_group_seq
+        self._pending_interrupt_ack = True
+        self._pending_interrupt_user_segment_seen = False
+        return "effective_interrupt", self._active_interrupt_group_id
+
+    def _close_interrupt_episode(self) -> None:
+        self._active_interrupt_group_id = None
+        self._pending_interrupt_ack = False
+        self._pending_interrupt_user_segment_seen = False
+        self._current_assistant_turn_role = "normal_reply"
+        self._current_assistant_interrupt_group_id = None
+
+    def _maybe_close_interrupt_episode(self, *, playback_active: bool) -> None:
+        if (
+            self._active_interrupt_group_id is None
+            or self._pending_interrupt_ack
+            or self._current_assistant_turn_role != "interrupt_ack"
+            or self._assistant_turn_open
+            or playback_active
+            or self._pending_assistant_audio
+            or self._assistant_playback_started
+            or self._barge_in_listen_lock
+        ):
+            return
+        self._close_interrupt_episode()
+
+    def _after_user_turn_state_update(
+        self,
+        *,
+        previous_user_turn_active: bool,
+        playback_active: bool,
+    ) -> None:
+        user_turn_started = not previous_user_turn_active and self._user_turn_active
+        if (
+            user_turn_started
+            and self._pending_interrupt_ack
+            and not self._assistant_turn_open
+        ):
+            if self._pending_interrupt_user_segment_seen:
+                LOGGER.info(
+                    "Closing pending interrupt episode without ack before new user turn at chunk=%s",
+                    self._active_chunk_index,
+                )
+                self._close_interrupt_episode()
+                return
+            self._pending_interrupt_user_segment_seen = True
+        self._maybe_close_interrupt_episode(playback_active=playback_active)
 
     def _update_barge_in_listen_lock(
         self,
