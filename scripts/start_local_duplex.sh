@@ -5,7 +5,23 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv/local-duplex311"
 RUNTIME_DIR="${ROOT_DIR}/.local_duplex"
 LOCAL_HF_HOME="${ROOT_DIR}/third_party/models/huggingface"
-MODE="${1:-omni}"
+CONFIG_PATH="${LOCAL_DUPLEX_CONFIG:-${ROOT_DIR}/configs/local_duplex.json}"
+
+MODE="omni"
+FORWARD_ARGS=()
+
+if [ "$#" -gt 0 ]; then
+  case "${1}" in
+    audio|omni)
+      MODE="${1}"
+      shift
+      ;;
+  esac
+fi
+
+if [ "$#" -gt 0 ]; then
+  FORWARD_ARGS=("$@")
+fi
 
 mkdir -p "${RUNTIME_DIR}"
 
@@ -33,7 +49,8 @@ export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/third_party/MiniCPM-o-Demo:${PYTHONPA
 
 nohup "${VENV_DIR}/bin/python" -u -m local_duplex.cli \
   "${MODE}" \
-  --config "${ROOT_DIR}/configs/local_duplex.json" \
+  "${FORWARD_ARGS[@]}" \
+  --config "${CONFIG_PATH}" \
   > "${RUNTIME_DIR}/runtime.log" 2>&1 &
 
 echo $! > "${RUNTIME_DIR}/runtime.pid"

@@ -128,6 +128,8 @@ class InteractionSessionLogger:
         kv_reset_count: int,
         speech_activation_window_open: bool,
         model_decision_bias: str,
+        unsolicited_speak_suppressed: bool,
+        unsolicited_speak_suppressed_count: int,
     ) -> None:
         user_frame_rel = self._save_frame(chunk_index, frame) if vision_used and frame is not None else None
         ai_audio_rel, ai_audio_duration_ms = self._save_ai_audio(chunk_index, result)
@@ -207,6 +209,8 @@ class InteractionSessionLogger:
                 "kv_reset_count": kv_reset_count,
                 "speech_activation_window_open": speech_activation_window_open,
                 "model_decision_bias": model_decision_bias,
+                "unsolicited_speak_suppressed": unsolicited_speak_suppressed,
+                "unsolicited_speak_suppressed_count": unsolicited_speak_suppressed_count,
                 "likely_causes": self._build_likely_causes(
                     result=result,
                     latency_ms=latency_ms,
@@ -299,6 +303,21 @@ class InteractionSessionLogger:
         listen_latencies = [event["performance"]["latency_ms"] for event in listen_events]
         omni_latencies = [event["performance"]["latency_ms"] for event in chunk_events if event["vision"]["used"]]
         audio_latencies = [event["performance"]["latency_ms"] for event in chunk_events if not event["vision"]["used"]]
+        worker_decode_latencies = [
+            event["performance"]["cost_llm_ms"]
+            for event in speak_events
+            if event["performance"]["cost_llm_ms"] is not None
+        ]
+        worker_wav_wait_latencies = [
+            event["performance"]["cost_tts_prep_ms"]
+            for event in speak_events
+            if event["performance"]["cost_tts_prep_ms"] is not None
+        ]
+        worker_trailing_wait_latencies = [
+            event["performance"]["cost_token2wav_ms"]
+            for event in speak_events
+            if event["performance"]["cost_token2wav_ms"] is not None
+        ]
         fragmented = [event for event in speak_events if event["analysis"]["fragmented_speech"]]
         over_budget = [event for event in speak_events if event["performance"]["over_budget"]]
         vision_used_count = sum(1 for event in chunk_events if event["vision"]["used"])
@@ -313,10 +332,20 @@ class InteractionSessionLogger:
             [event["analysis"].get("kv_reset_count", 0) for event in chunk_events] or [0]
         )
         stuck_listen_count = sum(1 for event in health_changes if event.get("state") == "stuck_listen")
+        unsolicited_speak_suppressed_count = max(
+            [event["analysis"].get("unsolicited_speak_suppressed_count", 0) for event in chunk_events] or [0]
+        )
+
+        conversation_flow = self._build_conversation_flow(chunk_events, system_events)
+        assistant_turns = [event for event in conversation_flow if event["kind"] == "assistant"]
 
         return {
             "session_id": self.session_id,
             "mode": self.mode,
+            "backend": self.config.model.backend,
+            "model_variant": (
+                self.config.model.gguf_variant if self.config.model.backend == "gguf" else "awq"
+            ),
             "session_dir": str(self.session_dir),
             "started_at": self._events[0]["ts"] if self._events else self._now_iso(),
             "total_chunks": len(chunk_events),
@@ -328,6 +357,7 @@ class InteractionSessionLogger:
             "consistency_error_count": consistency_error_count,
             "kv_reset_count": kv_reset_count,
             "stuck_listen_count": stuck_listen_count,
+            "unsolicited_speak_suppressed_count": unsolicited_speak_suppressed_count,
             "health_change_count": len(health_changes),
             "last_session_health": chunk_events[-1]["analysis"]["session_health"] if chunk_events else "healthy",
             "fragmented_speak_chunks": len(fragmented),
@@ -337,7 +367,17 @@ class InteractionSessionLogger:
             "avg_listen_latency_ms": self._avg(listen_latencies),
             "avg_omni_latency_ms": self._avg(omni_latencies),
             "avg_audio_latency_ms": self._avg(audio_latencies),
-            "conversation_flow": self._build_conversation_flow(chunk_events, system_events),
+            "avg_worker_decode_ms": self._avg(worker_decode_latencies),
+            "avg_worker_wav_wait_ms": self._avg(worker_wav_wait_latencies),
+            "avg_worker_trailing_wait_ms": self._avg(worker_trailing_wait_latencies),
+            "assistant_turn_count": len(assistant_turns),
+            "avg_chunks_per_assistant_turn": self._avg(
+                [turn["chunk_end"] - turn["chunk_start"] + 1 for turn in assistant_turns]
+            ),
+            "avg_turn_audio_duration_ms": self._avg(
+                [turn["audio_duration_ms"] for turn in assistant_turns]
+            ),
+            "conversation_flow": conversation_flow,
             "likely_stutter_causes": self._build_stutter_causes(
                 over_budget_count=len(over_budget),
                 fragmented_count=len(fragmented),
@@ -387,6 +427,7 @@ class InteractionSessionLogger:
                     "chunk_end": assistant_segment[-1]["chunk_index"],
                     "text": "".join(event["assistant"]["text"] for event in assistant_segment),
                     "avg_latency_ms": self._avg([event["performance"]["latency_ms"] for event in assistant_segment]),
+                    "audio_duration_ms": sum(event["assistant"]["audio_duration_ms"] for event in assistant_segment),
                     "vision_used": any(event["vision"]["used"] for event in assistant_segment),
                     "fragmented": any(event["analysis"]["fragmented_speech"] for event in assistant_segment),
                 }
@@ -409,11 +450,12 @@ class InteractionSessionLogger:
 
         for event in system_events:
             if event["event"] == "barge_in":
+                message = "Barge-in detected during playback"
                 flow.append(
                     {
                         "kind": "system",
                         "ts": event["ts"],
-                        "message": "Barge-in detected during playback",
+                        "message": message,
                     }
                 )
             elif event["event"] == "session_reset":
@@ -471,6 +513,8 @@ class InteractionSessionLogger:
             "",
             f"- Session ID: `{summary['session_id']}`",
             f"- Mode: `{summary['mode']}`",
+            f"- Backend: `{summary['backend']}`",
+            f"- Model Variant: `{summary['model_variant']}`",
             f"- Session Dir: `{summary['session_dir']}`",
             "",
             "## Overview",
@@ -485,6 +529,7 @@ class InteractionSessionLogger:
             f"- Consistency errors: `{summary['consistency_error_count']}`",
             f"- KV resets: `{summary['kv_reset_count']}`",
             f"- Stuck-listen recoveries: `{summary['stuck_listen_count']}`",
+            f"- Suppressed unsolicited speaks: `{summary['unsolicited_speak_suppressed_count']}`",
             "",
             "## Performance",
             "",
@@ -492,7 +537,13 @@ class InteractionSessionLogger:
             f"- Avg omni latency: `{self._format_number(summary['avg_omni_latency_ms'])} ms`",
             f"- Avg listen latency: `{self._format_number(summary['avg_listen_latency_ms'])} ms`",
             f"- Avg speak latency: `{self._format_number(summary['avg_speak_latency_ms'])} ms`",
+            f"- Avg worker decode: `{self._format_number(summary['avg_worker_decode_ms'])} ms`",
+            f"- Avg worker wav wait: `{self._format_number(summary['avg_worker_wav_wait_ms'])} ms`",
+            f"- Avg worker trailing wait: `{self._format_number(summary['avg_worker_trailing_wait_ms'])} ms`",
             f"- First speak delay: `{self._format_number(summary['first_speak_delay_ms'])} ms`",
+            f"- Assistant turns: `{summary['assistant_turn_count']}`",
+            f"- Avg chunks per assistant turn: `{self._format_number(summary['avg_chunks_per_assistant_turn'])}`",
+            f"- Avg assistant turn audio: `{self._format_number(summary['avg_turn_audio_duration_ms'])} ms`",
             f"- Fragmented speak chunks: `{summary['fragmented_speak_chunks']}`",
             f"- Speak chunks over budget: `{summary['speak_over_budget_chunks']}`",
             "",
@@ -520,6 +571,7 @@ class InteractionSessionLogger:
                         f"`{stamp}` assistant: {text} "
                         f"(chunks {event['chunk_start']}-{event['chunk_end']}, "
                         f"avg_latency={self._format_number(event['avg_latency_ms'])} ms, "
+                        f"audio={self._format_number(event['audio_duration_ms'])} ms, "
                         f"vision={'used' if event['vision_used'] else 'not used'}, "
                         f"fragmented={'yes' if event['fragmented'] else 'no'})"
                     )

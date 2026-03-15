@@ -28,8 +28,11 @@ uv venv --seed --python "${PYTHON_VERSION}" "${VENV_DIR}"
   "torchvision==0.21.0" \
   "torchaudio==2.6.0"
 "${VENV_DIR}/bin/python" -m pip install \
+  "cmake>=3.30.0" \
+  "ninja>=1.11.1" \
   "transformers==4.51.0" \
   "accelerate==1.12.0" \
+  "modelscope>=1.30.0" \
   "autoawq>=0.1.8" \
   "safetensors>=0.7.0" \
   "minicpmo-utils==1.0.6" \

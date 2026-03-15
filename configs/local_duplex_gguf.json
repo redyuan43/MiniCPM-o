@@ -1,0 +1,17 @@
+{
+  "model": {
+    "backend": "gguf",
+    "gguf_variant": "Q4_K_M",
+    "gguf_repo_id": "OpenBMB/MiniCPM-o-4_5-gguf",
+    "gguf_model_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf",
+    "gguf_audio_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf",
+    "gguf_vision_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/vision/MiniCPM-o-4_5-vision-F16.gguf",
+    "gguf_tts_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf",
+    "gguf_projector_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf",
+    "gguf_token2wav_dir": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/token2wav-gguf",
+    "gguf_worker_root": "third_party/llama.cpp-omni",
+    "gguf_worker_bin": "build/local_duplex_gguf_worker/bin/local-duplex-gguf-worker",
+    "gguf_ctx_size": 4096,
+    "gguf_n_gpu_layers": -1
+  }
+}

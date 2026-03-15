@@ -72,11 +72,31 @@ def list_input_devices() -> list[tuple[int, dict]]:
     ]
 
 
+def list_output_devices() -> list[tuple[int, dict]]:
+    ensure_sounddevice_available()
+    devices = sd.query_devices()
+    return [
+        (index, device)
+        for index, device in enumerate(devices)
+        if int(device.get("max_output_channels", 0)) > 0
+    ]
+
+
 def _find_pipewire_device_id() -> int | None:
     for index, device in list_input_devices():
         if "pipewire" in str(device.get("name", "")).lower():
             return index
     for index, device in list_input_devices():
+        if "default" in str(device.get("name", "")).lower():
+            return index
+    return None
+
+
+def _find_pipewire_output_device_id() -> int | None:
+    for index, device in list_output_devices():
+        if "pipewire" in str(device.get("name", "")).lower():
+            return index
+    for index, device in list_output_devices():
         if "default" in str(device.get("name", "")).lower():
             return index
     return None
@@ -88,6 +108,17 @@ def _match_input_device_by_name(selector: str) -> int | None:
         if selector_lower == str(device.get("name", "")).strip().lower():
             return index
     for index, device in list_input_devices():
+        if selector_lower in str(device.get("name", "")).lower():
+            return index
+    return None
+
+
+def _match_output_device_by_name(selector: str) -> int | None:
+    selector_lower = selector.strip().lower()
+    for index, device in list_output_devices():
+        if selector_lower == str(device.get("name", "")).strip().lower():
+            return index
+    for index, device in list_output_devices():
         if selector_lower in str(device.get("name", "")).lower():
             return index
     return None
@@ -127,6 +158,40 @@ def resolve_capture_device(device_selector: str | int | None) -> tuple[int | Non
     return matched_device_id, device_info, f"id={matched_device_id}:{device_info['name']}"
 
 
+def resolve_playback_device(device_selector: str | int | None) -> tuple[int | None, dict, str]:
+    ensure_sounddevice_available()
+    selector = "" if device_selector is None else str(device_selector).strip()
+
+    if not selector or selector.lower() == "default":
+        device_info = sd.query_devices(kind="output")
+        return None, device_info, f"default:{device_info['name']}"
+
+    if selector.lower() == "pipewire":
+        pipewire_device_id = _find_pipewire_output_device_id()
+        if pipewire_device_id is None:
+            device_info = sd.query_devices(kind="output")
+            return None, device_info, f"default:{device_info['name']}"
+        device_info = sd.query_devices(pipewire_device_id)
+        return pipewire_device_id, device_info, f"id={pipewire_device_id}:{device_info['name']}"
+
+    if selector.isdigit():
+        device_id = int(selector)
+        device_info = sd.query_devices(device_id)
+        if int(device_info.get("max_output_channels", 0)) < 1:
+            raise RuntimeError(f"Configured playback device id={device_id} has no output channels")
+        return device_id, device_info, f"id={device_id}:{device_info['name']}"
+
+    matched_device_id = _match_output_device_by_name(selector)
+    if matched_device_id is None:
+        available_names = ", ".join(str(device["name"]) for _, device in list_output_devices())
+        raise RuntimeError(
+            f"Unable to resolve playback device '{selector}'. "
+            f"Available output devices: {available_names or 'none'}"
+        )
+    device_info = sd.query_devices(matched_device_id)
+    return matched_device_id, device_info, f"id={matched_device_id}:{device_info['name']}"
+
+
 def validate_capture_device(
     device_selector: str | int | None,
     sample_rate: int,
@@ -142,6 +207,32 @@ def validate_capture_device(
         dtype=dtype,
     )
     return device_id, device_info, device_label
+
+
+def validate_playback_device(
+    device_selector: str | int | None,
+    sample_rate: int,
+    channels: int = 2,
+    dtype: str = "float32",
+) -> tuple[int | None, dict, str]:
+    device_id, device_info, device_label = resolve_playback_device(device_selector)
+    ensure_sounddevice_available()
+    sd.check_output_settings(
+        device=device_id,
+        samplerate=sample_rate,
+        channels=channels,
+        dtype=dtype,
+    )
+    return device_id, device_info, device_label
+
+
+def prefers_sounddevice_playback(device_selector: str | int | None) -> bool:
+    selector = "" if device_selector is None else str(device_selector).strip().lower()
+    if not selector or selector in {"default", "pipewire"}:
+        return True
+    if selector.startswith(("hw:", "plughw:", "sysdefault:")):
+        return False
+    return True
 
 
 class SoundDeviceCapture:
@@ -311,6 +402,11 @@ class AplayPlayback:
         self._playback_deadline_monotonic = 0.0
 
     def start(self) -> None:
+        self._spawn_proc()
+        self._thread = threading.Thread(target=self._writer_loop, name="aplay-playback", daemon=True)
+        self._thread.start()
+
+    def _spawn_proc(self) -> None:
         cmd = [
             "aplay",
             "-D",
@@ -331,8 +427,21 @@ class AplayPlayback:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        self._thread = threading.Thread(target=self._writer_loop, name="aplay-playback", daemon=True)
-        self._thread.start()
+
+    def _restart_proc(self, reason: str) -> None:
+        LOGGER.warning("Playback sink exited after %s, restarting aplay.", reason)
+        if self._proc is not None:
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if self._proc.stderr is not None:
+                    self._proc.stderr.close()
+            except Exception:
+                pass
+        self._spawn_proc()
 
     @property
     def active(self) -> bool:
@@ -410,6 +519,7 @@ class AplayPlayback:
                 continue
 
             try:
+                self._check_proc_state()
                 self._proc.stdin.write(np.asarray(chunk, dtype=np.int32).tobytes())
                 self._proc.stdin.flush()
             except BrokenPipeError as exc:
@@ -420,4 +530,155 @@ class AplayPlayback:
             stderr = b""
             if self._proc.stderr is not None:
                 stderr = self._proc.stderr.read()
-            raise RuntimeError(f"aplay exited unexpectedly: {stderr.decode(errors='ignore').strip()}")
+            message = stderr.decode(errors="ignore").strip()
+            if self._stop.is_set():
+                return
+            if "underrun" in message.lower():
+                self._restart_proc("ALSA underrun")
+                return
+            raise RuntimeError(f"aplay exited unexpectedly: {message}")
+
+
+class SoundDevicePlayback:
+    """Writes float32 stereo audio to a shared PortAudio output stream."""
+
+    def __init__(self, config: AudioConfig) -> None:
+        self.config = config
+        self._queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=config.output_queue_max_chunks)
+        self._active = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._stream = None
+        self._device_label = "unresolved"
+        self._timing_lock = threading.Lock()
+        self._active_since_monotonic = 0.0
+        self._playback_deadline_monotonic = 0.0
+
+    def start(self) -> None:
+        device_id, device_info, device_label = validate_playback_device(
+            self.config.playback_device,
+            sample_rate=self.config.playback_sample_rate,
+            channels=self.config.playback_channels,
+            dtype="float32",
+        )
+        self._device_label = device_label
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=self.config.playback_sample_rate,
+                device=device_id,
+                channels=self.config.playback_channels,
+                dtype="float32",
+                finished_callback=self._finished_callback,
+            )
+            self._stream.start()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to open output stream ({device_label}): {exc}") from exc
+        LOGGER.info(
+            "Using audio output device: %s (channels=%s default_rate=%.1f)",
+            device_label,
+            int(device_info.get("max_output_channels", 0)),
+            float(device_info.get("default_samplerate", 0.0)),
+        )
+        self._thread = threading.Thread(target=self._writer_loop, name="sd-playback", daemon=True)
+        self._thread.start()
+
+    @property
+    def active(self) -> bool:
+        if not self._active.is_set():
+            return False
+        with self._timing_lock:
+            if time.monotonic() >= self._playback_deadline_monotonic:
+                self._active.clear()
+                self._active_since_monotonic = 0.0
+                return False
+            return True
+
+    @property
+    def active_duration_ms(self) -> float:
+        if not self.active:
+            return 0.0
+        with self._timing_lock:
+            return max(0.0, (time.monotonic() - self._active_since_monotonic) * 1000.0)
+
+    @property
+    def remaining_ms(self) -> float:
+        if not self.active:
+            return 0.0
+        with self._timing_lock:
+            return max(0.0, (self._playback_deadline_monotonic - time.monotonic()) * 1000.0)
+
+    def enqueue_model_audio(self, mono_audio_24k: np.ndarray) -> None:
+        stereo = upsample_mono_24k_to_stereo_48k(mono_audio_24k)
+        self._queue.put(stereo, timeout=5)
+        duration_s = float(len(mono_audio_24k)) / float(self.config.model_output_sample_rate)
+        with self._timing_lock:
+            now = time.monotonic()
+            if not self._active.is_set():
+                self._active_since_monotonic = now
+                self._playback_deadline_monotonic = now
+            base = max(now, self._playback_deadline_monotonic)
+            self._playback_deadline_monotonic = base + duration_s
+        self._active.set()
+
+    def clear(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                self._active.clear()
+                with self._timing_lock:
+                    self._active_since_monotonic = 0.0
+                    self._playback_deadline_monotonic = 0.0
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self._stream is not None:
+            try:
+                self._stream.abort(ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                self._stream.close(ignore_errors=True)
+            except Exception:
+                pass
+            self._stream = None
+
+    def _writer_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                chunk = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self.remaining_ms <= 0:
+                    self._active.clear()
+                    with self._timing_lock:
+                        self._active_since_monotonic = 0.0
+                        self._playback_deadline_monotonic = 0.0
+                self._check_stream_state()
+                continue
+
+            try:
+                self._check_stream_state()
+                assert self._stream is not None
+                self._stream.write(np.asarray(chunk, dtype=np.float32))
+            except Exception as exc:
+                raise RuntimeError(f"sounddevice playback failed on {self._device_label}: {exc}") from exc
+
+    def _finished_callback(self) -> None:
+        if self._stop.is_set():
+            return
+        LOGGER.warning("Output stream finished unexpectedly on %s", self._device_label)
+
+    def _check_stream_state(self) -> None:
+        if self._stream is None:
+            raise RuntimeError("sounddevice output stream is not initialized")
+        if self._stream.closed and not self._stop.is_set():
+            raise RuntimeError(f"output stream closed unexpectedly on {self._device_label}")
+
+
+def create_playback_backend(config: AudioConfig):
+    if prefers_sounddevice_playback(config.playback_device):
+        return SoundDevicePlayback(config)
+    return AplayPlayback(config)

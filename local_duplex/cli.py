@@ -12,7 +12,9 @@ from local_duplex.config import DEFAULT_CONFIG_PATH, load_runtime_config
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local MiniCPM-o duplex runtime")
     parser.add_argument("mode", choices=("audio", "omni"))
+    parser.add_argument("--audio-only", action="store_true", help="Force audio-only duplex mode and disable vision")
     parser.add_argument("--config", default=None, help="Path to a JSON config file")
+    parser.add_argument("--backend", choices=("pytorch", "gguf"), default=None, help="Override inference backend")
     parser.add_argument("--model-path", default=None, help="Override model path or repo id")
     parser.add_argument("--capture-device", default=None, help="Override capture device selector (pipewire/default/device id/name)")
     parser.add_argument("--playback-device", default=None, help="Override ALSA playback device")
@@ -26,8 +28,13 @@ def main() -> int:
     args = parser.parse_args()
 
     config = load_runtime_config(args.config or str(DEFAULT_CONFIG_PATH))
+    if args.backend:
+        config.model.backend = args.backend
     if args.model_path:
-        config.model.model_path = args.model_path
+        if config.model.backend == "gguf":
+            config.model.gguf_model_path = args.model_path
+        else:
+            config.model.model_path = args.model_path
     if args.capture_device:
         config.audio.capture_device = args.capture_device
     if args.playback_device:
@@ -36,6 +43,7 @@ def main() -> int:
         config.video.camera_device = args.camera_device
     if args.no_preview:
         config.video.preview = False
+    effective_mode = "audio" if args.audio_only else args.mode
 
     runtime_dir = Path(config.runtime.runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -47,7 +55,7 @@ def main() -> int:
 
     from local_duplex.runtime import LocalDuplexRunner
 
-    runner = LocalDuplexRunner(mode=args.mode, config=config)
+    runner = LocalDuplexRunner(mode=effective_mode, config=config)
     runner.run()
     return 0
 

@@ -24,9 +24,28 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 @dataclass(slots=True)
 class ModelConfig:
+    backend: str
     model_path: str
+    gguf_repo_id: str
+    gguf_variant: str
+    gguf_model_path: str
+    gguf_audio_path: str
+    gguf_vision_path: str
+    gguf_tts_path: str
+    gguf_projector_path: str
+    gguf_token2wav_dir: str
+    gguf_worker_root: str
+    gguf_worker_bin: str
+    gguf_ctx_size: int
+    gguf_n_gpu_layers: int
+    gguf_wav_wait_ms: int
+    gguf_wav_idle_stable_ms: int
+    gguf_wav_empty_wait_ms: int
+    gguf_trailing_wait_ms: int
+    gguf_trailing_idle_stable_ms: int
     attn_implementation: str
     device: str
+    device_index: int
     compile: bool
     preload_both_tts: bool
 
@@ -80,6 +99,8 @@ class RuntimeConfig:
     log_level: str
     session_max_chunks: int
     enable_speech_listen_reset: bool
+    allow_unsolicited_speak: bool
+    unsolicited_speak_reset_threshold: int
     session_reset_after_speech_listens: int
     session_min_chunks_before_speech_reset: int
     speech_detect_rms: float
@@ -91,6 +112,14 @@ class RuntimeConfig:
     stuck_listen_speech_chunks: int
     speak_latency_budget_ms: int
     listen_latency_budget_ms: int
+    playback_start_buffer_ms: int
+    playback_start_buffer_chunks: int
+    playback_immediate_start_min_ms: int
+    assistant_continuation_grace_chunks: int
+    idle_kv_cleanup_after_ms: int
+    chunk_barge_in_rms_threshold: float
+    chunk_barge_in_peak_threshold: float
+    chunk_barge_in_consecutive_chunks: int
 
 
 @dataclass(slots=True)
@@ -104,21 +133,40 @@ class DuplexRuntimeConfig:
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": {
+        "backend": "gguf",
         "model_path": "openbmb/MiniCPM-o-4_5-awq",
+        "gguf_repo_id": "OpenBMB/MiniCPM-o-4_5-gguf",
+        "gguf_variant": "Q4_K_M",
+        "gguf_model_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf",
+        "gguf_audio_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf",
+        "gguf_vision_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/vision/MiniCPM-o-4_5-vision-F16.gguf",
+        "gguf_tts_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf",
+        "gguf_projector_path": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf",
+        "gguf_token2wav_dir": "third_party/models/modelscope/MiniCPM-o-4_5-gguf/token2wav-gguf",
+        "gguf_worker_root": "third_party/llama.cpp-omni",
+        "gguf_worker_bin": "build/local_duplex_gguf_worker/bin/local-duplex-gguf-worker",
+        "gguf_ctx_size": 4096,
+        "gguf_n_gpu_layers": -1,
+        "gguf_wav_wait_ms": 900,
+        "gguf_wav_idle_stable_ms": 80,
+        "gguf_wav_empty_wait_ms": 220,
+        "gguf_trailing_wait_ms": 150,
+        "gguf_trailing_idle_stable_ms": 60,
         "attn_implementation": "sdpa",
         "device": "cuda",
+        "device_index": 0,
         "compile": False,
         "preload_both_tts": True,
     },
     "audio": {
         "capture_device": "pipewire",
-        "playback_device": "hw:CARD=NVidia,DEV=3",
+        "playback_device": "pipewire",
         "input_sample_rate": 16000,
         "model_output_sample_rate": 24000,
         "playback_sample_rate": 48000,
         "playback_channels": 2,
         "read_window_ms": 20,
-        "chunk_ms": 400,
+        "chunk_ms": 1000,
         "interrupt_rms_threshold": 0.05,
         "interrupt_peak_threshold": 0.25,
         "interrupt_min_playback_ms": 600,
@@ -132,40 +180,51 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "capture_width": 640,
         "capture_height": 360,
         "capture_fps": 15,
-        "frame_interval_ms": 4000,
+        "frame_interval_ms": 1000,
         "max_slice_nums": 1,
         "preview": False,
     },
     "session": {
         "system_prompt": (
             "You are a bilingual robot assistant. Respond with short spoken answers, "
-            "stay interruptible, and mention important scene changes proactively."
+            "stay interruptible, and only speak after clear user speech. "
+            "Do not proactively start talking when the user is silent."
         ),
-        "force_listen_count": 4,
-        "max_new_speak_tokens_per_chunk": 14,
+        "force_listen_count": 3,
+        "max_new_speak_tokens_per_chunk": 20,
         "temperature": 0.7,
         "top_k": 20,
         "top_p": 0.8,
-        "listen_prob_scale": 0.9,
+        "listen_prob_scale": 1.0,
         "speech_eager_chunks": 2,
-        "speech_eager_listen_prob_scale": 0.8,
+        "speech_eager_listen_prob_scale": 0.85,
     },
     "runtime": {
         "runtime_dir": ".local_duplex",
         "log_level": "INFO",
-        "session_max_chunks": 240,
+        "session_max_chunks": 360,
         "enable_speech_listen_reset": False,
+        "allow_unsolicited_speak": False,
+        "unsolicited_speak_reset_threshold": 2,
         "session_reset_after_speech_listens": 18,
         "session_min_chunks_before_speech_reset": 18,
         "speech_detect_rms": 0.01,
         "speech_activation_chunks": 2,
         "speech_activation_min_rms": 0.015,
-        "speech_activation_grace_after_reset_chunks": 6,
+        "speech_activation_grace_after_reset_chunks": 3,
         "consistency_error_reset_threshold": 1,
         "kv_reset_threshold": 2,
         "stuck_listen_speech_chunks": 10,
-        "speak_latency_budget_ms": 1100,
+        "speak_latency_budget_ms": 1000,
         "listen_latency_budget_ms": 250,
+        "playback_start_buffer_ms": 1600,
+        "playback_start_buffer_chunks": 2,
+        "playback_immediate_start_min_ms": 900,
+        "assistant_continuation_grace_chunks": 4,
+        "idle_kv_cleanup_after_ms": 15000,
+        "chunk_barge_in_rms_threshold": 1.1,
+        "chunk_barge_in_peak_threshold": 1.1,
+        "chunk_barge_in_consecutive_chunks": 999,
     },
 }
 
@@ -186,6 +245,17 @@ def load_runtime_config(path: str | None = None) -> DuplexRuntimeConfig:
     merged["audio"]["reference_audio_path"] = _resolve_path(merged["audio"]["reference_audio_path"])
     if merged["model"]["model_path"].startswith(("/", ".")):
         merged["model"]["model_path"] = _resolve_path(merged["model"]["model_path"])
+    for key in (
+        "gguf_model_path",
+        "gguf_audio_path",
+        "gguf_vision_path",
+        "gguf_tts_path",
+        "gguf_projector_path",
+        "gguf_token2wav_dir",
+        "gguf_worker_root",
+        "gguf_worker_bin",
+    ):
+        merged["model"][key] = _resolve_path(merged["model"][key])
 
     return DuplexRuntimeConfig(
         model=ModelConfig(**merged["model"]),

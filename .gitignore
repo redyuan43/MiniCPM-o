@@ -6,3 +6,5 @@ __pycache__
 third_party/models/
 .serena/
 dist/
+build/
+third_party/llama.cpp-omni/

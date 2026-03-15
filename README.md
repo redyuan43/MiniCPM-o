@@ -154,6 +154,20 @@ If you need to inspect the available local input devices before running:
 ./scripts/list_local_duplex_audio_devices.sh
 ```
 
+The default local duplex runtime now uses the local GGUF `Q4_K_M` backend. Prepare the local GGUF assets from ModelScope and build the local non-HTTP worker once:
+
+```bash
+./scripts/prepare_local_duplex_gguf.sh
+./scripts/build_local_duplex_gguf_backend.sh
+./scripts/run_local_duplex.sh omni
+```
+
+If you need to fall back to the previous PyTorch/AWQ route for comparison or debugging:
+
+```bash
+./.venv/local-duplex311/bin/python -m local_duplex.cli omni --backend pytorch
+```
+
 
 ## MiniCPM-o 4.5
 
