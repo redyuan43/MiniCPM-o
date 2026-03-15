@@ -24,6 +24,7 @@ from local_duplex.config import AudioConfig
 FLOAT32_LE = "<f4"
 INT32_MAX = np.int32(2147483647)
 LOGGER = logging.getLogger("local_duplex.audio")
+PLAYBACK_PACKET_MS = 160
 
 
 def upsample_mono_24k_to_stereo_48k(audio: np.ndarray) -> np.ndarray:
@@ -52,6 +53,15 @@ def float_stereo_to_pcm_s32(audio: np.ndarray) -> np.ndarray:
 def decode_model_audio(audio_base64: str) -> np.ndarray:
     raw = base64.b64decode(audio_base64)
     return np.frombuffer(raw, dtype=np.dtype(FLOAT32_LE)).copy()
+
+
+def split_model_audio_for_playback(audio: np.ndarray, sample_rate: int) -> list[np.ndarray]:
+    """Split model audio into short playback packets so barge-in can stop faster."""
+    mono = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if mono.size == 0:
+        return []
+    packet_samples = max(1, sample_rate * PLAYBACK_PACKET_MS // 1000)
+    return [mono[index : index + packet_samples].copy() for index in range(0, mono.size, packet_samples)]
 
 
 def ensure_sounddevice_available() -> None:
@@ -469,10 +479,11 @@ class AplayPlayback:
             return max(0.0, (self._playback_deadline_monotonic - time.monotonic()) * 1000)
 
     def enqueue_model_audio(self, mono_audio_24k: np.ndarray) -> None:
-        stereo = upsample_mono_24k_to_stereo_48k(mono_audio_24k)
-        pcm = float_stereo_to_pcm_s32(stereo)
-        self._queue.put(pcm, timeout=5)
         duration_s = float(len(mono_audio_24k)) / float(self.config.model_output_sample_rate)
+        for packet in split_model_audio_for_playback(mono_audio_24k, self.config.model_output_sample_rate):
+            stereo = upsample_mono_24k_to_stereo_48k(packet)
+            pcm = float_stereo_to_pcm_s32(stereo)
+            self._queue.put(pcm, timeout=5)
         with self._timing_lock:
             now = time.monotonic()
             if not self._active.is_set():
@@ -608,9 +619,10 @@ class SoundDevicePlayback:
             return max(0.0, (self._playback_deadline_monotonic - time.monotonic()) * 1000.0)
 
     def enqueue_model_audio(self, mono_audio_24k: np.ndarray) -> None:
-        stereo = upsample_mono_24k_to_stereo_48k(mono_audio_24k)
-        self._queue.put(stereo, timeout=5)
         duration_s = float(len(mono_audio_24k)) / float(self.config.model_output_sample_rate)
+        for packet in split_model_audio_for_playback(mono_audio_24k, self.config.model_output_sample_rate):
+            stereo = upsample_mono_24k_to_stereo_48k(packet)
+            self._queue.put(stereo, timeout=5)
         with self._timing_lock:
             now = time.monotonic()
             if not self._active.is_set():

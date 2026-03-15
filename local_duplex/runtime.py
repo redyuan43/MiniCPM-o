@@ -30,6 +30,7 @@ from local_duplex.video import VideoWorker
 
 
 LOGGER = logging.getLogger("local_duplex")
+POST_BARGE_IN_RELEASE_SILENT_CHUNKS = 1
 
 
 class _RuntimeSignalHandler(logging.Handler):
@@ -90,6 +91,8 @@ class LocalDuplexRunner:
         self._observed_loggers: list[logging.Logger] = []
         self._playback_echo_suppressed_chunks = 0
         self._barge_in_latched = False
+        self._barge_in_listen_lock = False
+        self._barge_in_release_silent_chunks_remaining = 0
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
@@ -116,8 +119,6 @@ class LocalDuplexRunner:
                 playback_active = self.playback.active
                 playback_active_ms = self.playback.active_duration_ms
                 playback_remaining_ms = self.playback.remaining_ms
-                if not playback_active:
-                    self._barge_in_latched = False
                 self.capture.set_playback_state(
                     playback_active,
                     playback_active_ms,
@@ -156,6 +157,13 @@ class LocalDuplexRunner:
                     playback_active=playback_active,
                     barge_in_detected=barge_in_detected,
                 )
+                barge_in_listen_lock_active = self._update_barge_in_listen_lock(
+                    playback_active=playback_active,
+                    speech_detected=speech_detected,
+                    speech_activation_window_open=speech_activation_window_open,
+                )
+                if not playback_active and not barge_in_listen_lock_active:
+                    self._barge_in_latched = False
                 self._update_user_turn_state(
                     speech_detected=speech_detected,
                     speech_activation_window_open=speech_activation_window_open,
@@ -163,7 +171,13 @@ class LocalDuplexRunner:
                 )
                 if barge_in_detected:
                     self._barge_in_latched = True
+                    self._barge_in_listen_lock = True
+                    self._barge_in_release_silent_chunks_remaining = POST_BARGE_IN_RELEASE_SILENT_CHUNKS
+                    barge_in_listen_lock_active = True
                     self._close_assistant_turn()
+                    self.playback.clear()
+                    self._assistant_playback_started = False
+                    self._clear_pending_assistant_audio()
                     LOGGER.info("Barge-in detected, issuing duplex break")
                     self._backend.set_break()
                     if self._session_logger is not None:
@@ -220,6 +234,7 @@ class LocalDuplexRunner:
                     result, model_decision_bias = self._generate_with_speech_bias(
                         speech_activation_window_open=speech_activation_window_open,
                         playback_active=playback_active,
+                        barge_in_listen_lock_active=barge_in_listen_lock_active,
                     )
                     result = self._apply_force_listen_guard(result)
                     result, unsolicited_speak_suppressed = self._apply_unsolicited_speak_guard(
@@ -227,6 +242,10 @@ class LocalDuplexRunner:
                         speech_detected=speech_detected,
                         speech_activation_window_open=speech_activation_window_open,
                         playback_active=playback_active,
+                    )
+                    result = self._apply_barge_in_listen_lock_guard(
+                        result=result,
+                        lock_active=barge_in_listen_lock_active,
                     )
                     if unsolicited_speak_suppressed:
                         model_decision_bias = self._last_model_decision_bias
@@ -239,6 +258,19 @@ class LocalDuplexRunner:
                 latency_ms = (time.perf_counter() - chunk_start) * 1000
                 backend_end_of_turn = self._result_backend_end_of_turn(result)
                 stop_reason = self._result_stop_reason(result)
+                if barge_in_detected and not result.is_listen:
+                    LOGGER.info("Suppressing assistant residual speak after barge-in at chunk=%s", chunk_index)
+                    result.is_listen = True
+                    result.text = ""
+                    result.audio_data = None
+                    self._set_result_stop_metadata(
+                        result,
+                        stop_reason="barge_in_suppressed",
+                        backend_end_of_turn=False,
+                        ended_with_listen=True,
+                    )
+                    backend_end_of_turn = False
+                    stop_reason = "barge_in_suppressed"
 
                 if result.is_listen:
                     if result.audio_data:
@@ -506,17 +538,30 @@ class LocalDuplexRunner:
         self._chunk_barge_in_streak = 0
         self._playback_echo_suppressed_chunks = 0
         self._barge_in_latched = False
+        self._barge_in_listen_lock = False
+        self._barge_in_release_silent_chunks_remaining = 0
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
         self._set_session_health("healthy", f"reset_complete:{reason}", chunk_index)
 
-    def _generate_with_speech_bias(self, speech_activation_window_open: bool, playback_active: bool):
+    def _generate_with_speech_bias(
+        self,
+        speech_activation_window_open: bool,
+        playback_active: bool,
+        barge_in_listen_lock_active: bool,
+    ):
         force_listen_active = self._session_chunk_count < self.config.session.force_listen_count
-        use_speech_bias = not force_listen_active and not playback_active and speech_activation_window_open
+        use_speech_bias = (
+            not force_listen_active
+            and not playback_active
+            and not barge_in_listen_lock_active
+            and speech_activation_window_open
+        )
         use_continuation_bias = (
             not force_listen_active
             and not playback_active
+            and not barge_in_listen_lock_active
             and not self._user_turn_active
             and not speech_activation_window_open
             and self._assistant_turn_open
@@ -527,6 +572,9 @@ class LocalDuplexRunner:
         if force_listen_active:
             listen_prob_scale_override = max(self.config.session.listen_prob_scale, 2.0)
             model_decision_bias = "forced_listen"
+        elif barge_in_listen_lock_active:
+            listen_prob_scale_override = max(self.config.session.listen_prob_scale, 2.0)
+            model_decision_bias = "barge_in_listen_lock"
         elif use_continuation_bias:
             listen_prob_scale_override = min(
                 self.config.session.listen_prob_scale,
@@ -619,6 +667,25 @@ class LocalDuplexRunner:
         self._last_model_decision_bias = "unsolicited_speak_suppressed"
         return result, True
 
+    def _apply_barge_in_listen_lock_guard(self, *, result, lock_active: bool):
+        if result.is_listen or not lock_active:
+            return result
+        LOGGER.info(
+            "Suppressing assistant speak during post-barge-in listen lock at session_chunk=%s",
+            self._session_chunk_count,
+        )
+        result.is_listen = True
+        result.text = ""
+        result.audio_data = None
+        self._set_result_stop_metadata(
+            result,
+            stop_reason="barge_in_listen_lock",
+            backend_end_of_turn=False,
+            ended_with_listen=True,
+        )
+        self._last_model_decision_bias = "barge_in_listen_lock"
+        return result
+
     def _update_assistant_turn_state(self, result) -> None:
         backend_end_of_turn = self._result_backend_end_of_turn(result)
         stop_reason = self._result_stop_reason(result)
@@ -707,6 +774,26 @@ class LocalDuplexRunner:
     def _close_assistant_turn(self) -> None:
         self._assistant_turn_open = False
         self._assistant_continuation_grace_remaining = 0
+
+    def _update_barge_in_listen_lock(
+        self,
+        *,
+        playback_active: bool,
+        speech_detected: bool,
+        speech_activation_window_open: bool,
+    ) -> bool:
+        if not self._barge_in_listen_lock:
+            return False
+        if playback_active:
+            return True
+        if speech_detected or speech_activation_window_open:
+            self._barge_in_release_silent_chunks_remaining = POST_BARGE_IN_RELEASE_SILENT_CHUNKS
+            return True
+        if self._barge_in_release_silent_chunks_remaining > 0:
+            self._barge_in_release_silent_chunks_remaining -= 1
+            return True
+        self._barge_in_listen_lock = False
+        return False
 
     def _should_send_vision(
         self,
