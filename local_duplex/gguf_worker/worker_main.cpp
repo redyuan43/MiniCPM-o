@@ -38,6 +38,7 @@ struct WorkerState {
     int wav_empty_wait_ms = 220;
     int trailing_wait_ms = 150;
     int trailing_idle_stable_ms = 60;
+    int final_speek_wait_ms = 900;
     bool initialized = false;
     bool prepared = false;
 };
@@ -187,6 +188,26 @@ WavCollectResult collect_generate_wavs(
     };
 }
 
+int wait_for_speek_done(WorkerState & state) {
+    if (state.ctx == nullptr || state.ctx->speek_done || state.final_speek_wait_ms <= 0) {
+        return 0;
+    }
+    constexpr int kPollMs = 20;
+    const auto start = std::chrono::steady_clock::now();
+    while (!state.ctx->speek_done) {
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start
+        ).count();
+        if (elapsed_ms >= state.final_speek_wait_ms) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+    }
+    return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start
+    ).count());
+}
+
 void drain_text_queue(omni_context * ctx, bool & is_listen, bool & end_of_turn, std::string & text) {
     std::lock_guard<std::mutex> lock(ctx->text_mtx);
     while (!ctx->text_queue.empty()) {
@@ -296,6 +317,7 @@ json handle_init(WorkerState & state, const json & req) {
     state.wav_empty_wait_ms = req.value("wav_empty_wait_ms", 220);
     state.trailing_wait_ms = req.value("trailing_wait_ms", 150);
     state.trailing_idle_stable_ms = req.value("trailing_idle_stable_ms", 60);
+    state.final_speek_wait_ms = req.value("final_speek_wait_ms", 900);
     state.chunk_index = 1;
     state.last_seen_wav_index = scan_highest_wav_index(state.base_output_dir);
     state.initialized = true;
@@ -370,6 +392,9 @@ json handle_generate(WorkerState & state, const json & req) {
     bool end_of_turn = false;
     std::string text;
     drain_text_queue(state.ctx, is_listen, end_of_turn, text);
+    const int final_speek_wait_ms = (end_of_turn && state.ctx != nullptr && !state.ctx->speek_done)
+        ? wait_for_speek_done(state)
+        : 0;
     const bool should_collect_wavs =
         !is_listen || end_of_turn || !text.empty();
     const auto wav_result = should_collect_wavs
@@ -377,7 +402,7 @@ json handle_generate(WorkerState & state, const json & req) {
         : WavCollectResult{};
     const int used_chunk_index = state.chunk_index;
     state.chunk_index += 1;
-    const auto cost_all_ms = decode_ms + wav_result.wav_wait_ms + wav_result.trailing_wait_ms;
+    const auto cost_all_ms = decode_ms + final_speek_wait_ms + wav_result.wav_wait_ms + wav_result.trailing_wait_ms;
 
     return {
         {"ok", true},
@@ -387,6 +412,7 @@ json handle_generate(WorkerState & state, const json & req) {
         {"text", text},
         {"audio_wav_paths", wav_result.paths},
         {"decode_ms", decode_ms},
+        {"final_speek_wait_ms", final_speek_wait_ms},
         {"wav_wait_ms", wav_result.wav_wait_ms},
         {"trailing_wait_ms", wav_result.trailing_wait_ms},
         {"cost_all_ms", cost_all_ms},

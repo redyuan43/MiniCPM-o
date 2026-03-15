@@ -43,6 +43,7 @@ class ModelConfig:
     gguf_wav_empty_wait_ms: int
     gguf_trailing_wait_ms: int
     gguf_trailing_idle_stable_ms: int
+    gguf_final_speek_wait_ms: int
     attn_implementation: str
     device: str
     device_index: int
@@ -147,11 +148,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "gguf_worker_bin": "build/local_duplex_gguf_worker/bin/local-duplex-gguf-worker",
         "gguf_ctx_size": 4096,
         "gguf_n_gpu_layers": -1,
-        "gguf_wav_wait_ms": 900,
-        "gguf_wav_idle_stable_ms": 80,
+        "gguf_wav_wait_ms": 800,
+        "gguf_wav_idle_stable_ms": 70,
         "gguf_wav_empty_wait_ms": 220,
-        "gguf_trailing_wait_ms": 150,
-        "gguf_trailing_idle_stable_ms": 60,
+        "gguf_trailing_wait_ms": 260,
+        "gguf_trailing_idle_stable_ms": 80,
+        "gguf_final_speek_wait_ms": 900,
         "attn_implementation": "sdpa",
         "device": "cuda",
         "device_index": 0,
@@ -167,11 +169,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "playback_channels": 2,
         "read_window_ms": 20,
         "chunk_ms": 1000,
-        "interrupt_rms_threshold": 0.05,
-        "interrupt_peak_threshold": 0.25,
-        "interrupt_min_playback_ms": 600,
+        "interrupt_rms_threshold": 0.03,
+        "interrupt_peak_threshold": 0.14,
+        "interrupt_min_playback_ms": 180,
         "interrupt_tail_protect_ms": 250,
-        "interrupt_hold_ms": 260,
+        "interrupt_hold_ms": 90,
         "output_queue_max_chunks": 32,
         "reference_audio_path": "third_party/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav",
     },
@@ -186,12 +188,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "session": {
         "system_prompt": (
-            "You are a bilingual robot assistant. Respond with short spoken answers, "
-            "stay interruptible, and only speak after clear user speech. "
+            "You are a bilingual robot assistant. Only speak after clear user speech. "
+            "Keep simple confirmations short, but when the user asks for an explanation, story, "
+            "or a longer answer, respond naturally and finish the requested sentence or story. "
+            "Stay interruptible, but do not stop speaking unless the user clearly interrupts. "
             "Do not proactively start talking when the user is silent."
         ),
         "force_listen_count": 3,
-        "max_new_speak_tokens_per_chunk": 20,
+        "max_new_speak_tokens_per_chunk": 24,
         "temperature": 0.7,
         "top_k": 20,
         "top_p": 0.8,
@@ -217,14 +221,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "stuck_listen_speech_chunks": 10,
         "speak_latency_budget_ms": 1000,
         "listen_latency_budget_ms": 250,
-        "playback_start_buffer_ms": 1600,
-        "playback_start_buffer_chunks": 2,
-        "playback_immediate_start_min_ms": 900,
-        "assistant_continuation_grace_chunks": 4,
+        "playback_start_buffer_ms": 1000,
+        "playback_start_buffer_chunks": 1,
+        "playback_immediate_start_min_ms": 600,
+        "assistant_continuation_grace_chunks": 8,
         "idle_kv_cleanup_after_ms": 15000,
-        "chunk_barge_in_rms_threshold": 1.1,
-        "chunk_barge_in_peak_threshold": 1.1,
-        "chunk_barge_in_consecutive_chunks": 999,
+        "chunk_barge_in_rms_threshold": 0.024,
+        "chunk_barge_in_peak_threshold": 0.14,
+        "chunk_barge_in_consecutive_chunks": 1,
     },
 }
 

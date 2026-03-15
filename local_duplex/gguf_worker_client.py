@@ -97,6 +97,7 @@ class GgufWorkerClient:
             "wav_empty_wait_ms": self.config.model.gguf_wav_empty_wait_ms,
             "trailing_wait_ms": self.config.model.gguf_trailing_wait_ms,
             "trailing_idle_stable_ms": self.config.model.gguf_trailing_idle_stable_ms,
+            "final_speek_wait_ms": self.config.model.gguf_final_speek_wait_ms,
             "device_index": self.config.model.device_index,
             "max_new_speak_tokens_per_chunk": self.config.session.max_new_speak_tokens_per_chunk,
             "listen_prob_scale": self.config.session.listen_prob_scale,

@@ -89,6 +89,10 @@ class LocalDuplexRunner:
         self._chunk_barge_in_streak = 0
         self._signal_handler: _RuntimeSignalHandler | None = None
         self._observed_loggers: list[logging.Logger] = []
+        self._playback_echo_suppressed_chunks = 0
+        self._barge_in_latched = False
+        self._vision_question_frame_pending = False
+        self._user_turn_active = False
 
     def run(self) -> None:
         self._preflight()
@@ -112,6 +116,8 @@ class LocalDuplexRunner:
                 playback_active = self.playback.active
                 playback_active_ms = self.playback.active_duration_ms
                 playback_remaining_ms = self.playback.remaining_ms
+                if not playback_active:
+                    self._barge_in_latched = False
                 self.capture.set_playback_state(
                     playback_active,
                     playback_active_ms,
@@ -131,13 +137,32 @@ class LocalDuplexRunner:
                     audio_peak=audio_peak,
                 )
                 barge_in_detected = barge_in_detected or chunk_barge_in_detected
+                if barge_in_detected and self._barge_in_latched:
+                    barge_in_detected = False
+                playback_echo_suppressed = self._should_suppress_playback_echo(
+                    playback_active=playback_active,
+                    barge_in_detected=barge_in_detected,
+                    audio_rms=audio_rms,
+                    audio_peak=audio_peak,
+                )
+                effective_audio_chunk = (
+                    np.zeros_like(audio_chunk)
+                    if playback_echo_suppressed
+                    else audio_chunk
+                )
                 speech_activation_window_open = self._update_speech_activation(
                     audio_rms=audio_rms,
                     speech_detected=speech_detected,
                     playback_active=playback_active,
                     barge_in_detected=barge_in_detected,
                 )
+                self._update_user_turn_state(
+                    speech_detected=speech_detected,
+                    speech_activation_window_open=speech_activation_window_open,
+                    playback_active=playback_active,
+                )
                 if barge_in_detected:
+                    self._barge_in_latched = True
                     LOGGER.info("Barge-in detected, issuing duplex break")
                     self._backend.set_break()
                     if self._session_logger is not None:
@@ -160,6 +185,7 @@ class LocalDuplexRunner:
                     frame = self.video.latest_pil()
                     if frame is not None:
                         frame_list = [frame]
+                        self._vision_question_frame_pending = False
                         self._save_debug_frame(frame, chunk_index)
 
                 if self._session_chunk_count == self.config.session.force_listen_count:
@@ -170,7 +196,7 @@ class LocalDuplexRunner:
                     )
 
                 LOGGER.info(
-                    "input chunk=%s audio_rms=%.4f audio_peak=%.4f speech_detected=%s speech_recent=%s speech_activation_window_open=%s playback_active=%s playback_active_ms=%.1f playback_remaining_ms=%.1f vision_enabled=%s vision_attempt=%s session_health=%s",
+                    "input chunk=%s audio_rms=%.4f audio_peak=%.4f speech_detected=%s speech_recent=%s speech_activation_window_open=%s playback_active=%s playback_echo_suppressed=%s playback_active_ms=%.1f playback_remaining_ms=%.1f vision_enabled=%s vision_attempt=%s session_health=%s",
                     chunk_index,
                     audio_rms,
                     audio_peak,
@@ -178,6 +204,7 @@ class LocalDuplexRunner:
                     self._speech_recent_chunks_remaining > 0,
                     speech_activation_window_open,
                     playback_active,
+                    playback_echo_suppressed,
                     playback_active_ms,
                     playback_remaining_ms,
                     self._vision_enabled,
@@ -187,7 +214,7 @@ class LocalDuplexRunner:
 
                 chunk_start = time.perf_counter()
                 try:
-                    effective_frame_list, prefill_ms = self._prefill_with_fallback(audio_chunk, frame_list)
+                    effective_frame_list, prefill_ms = self._prefill_with_fallback(effective_audio_chunk, frame_list)
                     result, model_decision_bias = self._generate_with_speech_bias(
                         speech_activation_window_open=speech_activation_window_open,
                         playback_active=playback_active,
@@ -460,6 +487,10 @@ class LocalDuplexRunner:
         self._assistant_continuation_grace_remaining = 0
         self._last_interaction_monotonic = time.monotonic()
         self._chunk_barge_in_streak = 0
+        self._playback_echo_suppressed_chunks = 0
+        self._barge_in_latched = False
+        self._vision_question_frame_pending = False
+        self._user_turn_active = False
         self._set_session_health("healthy", f"reset_complete:{reason}", chunk_index)
 
     def _generate_with_speech_bias(self, speech_activation_window_open: bool, playback_active: bool):
@@ -626,15 +657,35 @@ class LocalDuplexRunner:
     ) -> bool:
         if not self._vision_enabled or self.video is None:
             return False
-        if chunk_index % self._video_every_n_chunks != 0:
-            return False
         if playback_active:
             return False
-        return (
+        return self._vision_question_frame_pending and (
             speech_detected
             or speech_activation_window_open
             or self._speech_recent_chunks_remaining > 0
         )
+
+    def _update_user_turn_state(
+        self,
+        *,
+        speech_detected: bool,
+        speech_activation_window_open: bool,
+        playback_active: bool,
+    ) -> None:
+        user_signal_active = (
+            not playback_active
+            and (
+                speech_detected
+                or speech_activation_window_open
+                or self._speech_recent_chunks_remaining > 0
+            )
+        )
+        if user_signal_active and not self._user_turn_active:
+            self._user_turn_active = True
+            self._vision_question_frame_pending = self._vision_enabled
+            return
+        if not user_signal_active:
+            self._user_turn_active = False
 
     def _preflight(self) -> None:
         ensure_sounddevice_available()
@@ -771,6 +822,25 @@ class LocalDuplexRunner:
             )
             return True
         return False
+
+    def _should_suppress_playback_echo(
+        self,
+        *,
+        playback_active: bool,
+        barge_in_detected: bool,
+        audio_rms: float,
+        audio_peak: float,
+    ) -> bool:
+        if not playback_active or barge_in_detected:
+            return False
+        looks_like_user_interrupt = (
+            audio_rms >= self.config.audio.interrupt_rms_threshold
+            and audio_peak >= self.config.audio.interrupt_peak_threshold
+        )
+        if looks_like_user_interrupt:
+            return False
+        self._playback_echo_suppressed_chunks += 1
+        return True
 
     def _set_session_health(self, new_state: str, reason: str, chunk_index: int) -> None:
         if self._session_health == new_state:
