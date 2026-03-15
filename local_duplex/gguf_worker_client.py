@@ -29,6 +29,9 @@ class GgufDuplexGenerateResult(BaseModel):
     text: str = ""
     audio_data: str | None = None
     end_of_turn: bool = False
+    backend_end_of_turn: bool = False
+    ended_with_listen: bool = False
+    stop_reason: str = "empty"
     current_time: int = 0
     cost_llm_ms: float | None = None
     cost_tts_prep_ms: float | None = None
@@ -160,6 +163,9 @@ class GgufWorkerClient:
             text=clean_text,
             audio_data=audio_data,
             end_of_turn=bool(response.get("end_of_turn", False)),
+            backend_end_of_turn=bool(response.get("backend_end_of_turn", response.get("end_of_turn", False))),
+            ended_with_listen=bool(response.get("ended_with_listen", False)),
+            stop_reason=str(response.get("stop_reason", "empty") or "empty"),
             current_time=int(response.get("chunk_index", self._current_chunk_index - 1)),
             cost_all_ms=float(response["cost_all_ms"]) if response.get("cost_all_ms") is not None else None,
             cost_llm_ms=float(response["decode_ms"]) if response.get("decode_ms") is not None else None,

@@ -55,7 +55,6 @@ class LocalDuplexRunner:
         self.config = config
         self.stop_event = threading.Event()
         self.runtime_dir = Path(config.runtime.runtime_dir)
-        self._video_every_n_chunks = max(1, config.video.frame_interval_ms // config.audio.chunk_ms)
         self.capture = SoundDeviceCapture(config.audio)
         self.playback = create_playback_backend(config.audio)
         self.video = VideoWorker(config.video) if mode == "omni" else None
@@ -93,6 +92,7 @@ class LocalDuplexRunner:
         self._barge_in_latched = False
         self._vision_question_frame_pending = False
         self._user_turn_active = False
+        self._last_vision_frame_sent_monotonic = 0.0
 
     def run(self) -> None:
         self._preflight()
@@ -163,6 +163,7 @@ class LocalDuplexRunner:
                 )
                 if barge_in_detected:
                     self._barge_in_latched = True
+                    self._close_assistant_turn()
                     LOGGER.info("Barge-in detected, issuing duplex break")
                     self._backend.set_break()
                     if self._session_logger is not None:
@@ -186,6 +187,7 @@ class LocalDuplexRunner:
                     if frame is not None:
                         frame_list = [frame]
                         self._vision_question_frame_pending = False
+                        self._last_vision_frame_sent_monotonic = time.monotonic()
                         self._save_debug_frame(frame, chunk_index)
 
                 if self._session_chunk_count == self.config.session.force_listen_count:
@@ -235,12 +237,14 @@ class LocalDuplexRunner:
                         break
                     raise
                 latency_ms = (time.perf_counter() - chunk_start) * 1000
+                backend_end_of_turn = self._result_backend_end_of_turn(result)
+                stop_reason = self._result_stop_reason(result)
 
                 if result.is_listen:
                     if result.audio_data:
                         self._handle_assistant_audio(
                             decode_model_audio(result.audio_data),
-                            end_of_turn=bool(result.end_of_turn),
+                            end_of_turn=backend_end_of_turn,
                         )
                     self._flush_pending_assistant_audio(force=True)
                     LOGGER.info("listen chunk=%s latency_ms=%.1f", chunk_index, latency_ms)
@@ -255,7 +259,7 @@ class LocalDuplexRunner:
                     if result.audio_data:
                         self._handle_assistant_audio(
                             decode_model_audio(result.audio_data),
-                            end_of_turn=bool(result.end_of_turn),
+                            end_of_turn=backend_end_of_turn,
                         )
                 if speech_detected or playback_active:
                     self._last_interaction_monotonic = time.monotonic()
@@ -264,7 +268,8 @@ class LocalDuplexRunner:
                 reset_reason = self._after_chunk(
                     chunk_index=chunk_index,
                     result_is_listen=result.is_listen,
-                    result_end_of_turn=bool(result.end_of_turn),
+                    result_end_of_turn=backend_end_of_turn,
+                    result_stop_reason=stop_reason,
                     speech_detected=speech_detected,
                     speech_activation_window_open=speech_activation_window_open,
                 )
@@ -360,6 +365,7 @@ class LocalDuplexRunner:
         chunk_index: int,
         result_is_listen: bool,
         result_end_of_turn: bool,
+        result_stop_reason: str,
         speech_detected: bool,
         speech_activation_window_open: bool,
     ) -> str | None:
@@ -420,7 +426,18 @@ class LocalDuplexRunner:
             )
             return reason
 
-        if result_is_listen and speech_activation_window_open and speech_reset_window_open:
+        should_count_stuck_listen = (
+            result_is_listen
+            and speech_activation_window_open
+            and speech_reset_window_open
+            and self._session_chunk_count >= self.config.session.force_listen_count
+            and not self.playback.active
+            and not self._assistant_turn_open
+            and self._assistant_continuation_grace_remaining <= 0
+            and result_stop_reason == "listen"
+        )
+
+        if should_count_stuck_listen:
             self._stuck_listen_streak += 1
         elif result_is_listen:
             self._stuck_listen_streak = 0
@@ -491,16 +508,32 @@ class LocalDuplexRunner:
         self._barge_in_latched = False
         self._vision_question_frame_pending = False
         self._user_turn_active = False
+        self._last_vision_frame_sent_monotonic = 0.0
         self._set_session_health("healthy", f"reset_complete:{reason}", chunk_index)
 
     def _generate_with_speech_bias(self, speech_activation_window_open: bool, playback_active: bool):
         force_listen_active = self._session_chunk_count < self.config.session.force_listen_count
         use_speech_bias = not force_listen_active and not playback_active and speech_activation_window_open
+        use_continuation_bias = (
+            not force_listen_active
+            and not playback_active
+            and not self._user_turn_active
+            and not speech_activation_window_open
+            and self._assistant_turn_open
+            and self._assistant_continuation_grace_remaining > 0
+        )
         model_decision_bias = "default"
         listen_prob_scale_override: float | None = None
         if force_listen_active:
             listen_prob_scale_override = max(self.config.session.listen_prob_scale, 2.0)
             model_decision_bias = "forced_listen"
+        elif use_continuation_bias:
+            listen_prob_scale_override = min(
+                self.config.session.listen_prob_scale,
+                self.config.session.speech_eager_listen_prob_scale,
+                0.85,
+            )
+            model_decision_bias = "assistant_continuation"
         elif use_speech_bias:
             listen_prob_scale_override = self.config.session.speech_eager_listen_prob_scale
             model_decision_bias = "speech_activation"
@@ -519,6 +552,12 @@ class LocalDuplexRunner:
         result.is_listen = True
         result.text = ""
         result.audio_data = None
+        self._set_result_stop_metadata(
+            result,
+            stop_reason="force_listen_guard",
+            backend_end_of_turn=False,
+            ended_with_listen=True,
+        )
         return result
 
     def _apply_unsolicited_speak_guard(
@@ -571,19 +610,37 @@ class LocalDuplexRunner:
         result.text = ""
         result.audio_data = None
         result.end_of_turn = True
+        self._set_result_stop_metadata(
+            result,
+            stop_reason="unsolicited_speak_suppressed",
+            backend_end_of_turn=True,
+            ended_with_listen=True,
+        )
         self._last_model_decision_bias = "unsolicited_speak_suppressed"
         return result, True
 
     def _update_assistant_turn_state(self, result) -> None:
+        backend_end_of_turn = self._result_backend_end_of_turn(result)
+        stop_reason = self._result_stop_reason(result)
         if result.is_listen:
-            if not self.playback.active:
+            if backend_end_of_turn:
+                self._close_assistant_turn()
+                return
+            if stop_reason == "listen" and (
+                self._assistant_turn_open or self._assistant_continuation_grace_remaining > 0
+            ):
+                self._assistant_turn_open = True
+            elif not self.playback.active and self._assistant_continuation_grace_remaining <= 0:
                 self._assistant_turn_open = False
             if self._assistant_continuation_grace_remaining > 0:
                 self._assistant_continuation_grace_remaining -= 1
             return
         self._unsolicited_speak_suppressed_count = 0
+        if backend_end_of_turn:
+            self._close_assistant_turn()
+            return
         self._assistant_continuation_grace_remaining = self.config.runtime.assistant_continuation_grace_chunks
-        self._assistant_turn_open = not bool(result.end_of_turn)
+        self._assistant_turn_open = stop_reason in {"chunk_limit", "chunk_pause", "speak"}
 
     @staticmethod
     def _is_shutdown_interruption(exc: Exception) -> bool:
@@ -647,6 +704,10 @@ class LocalDuplexRunner:
         self._pending_assistant_audio_duration_ms = 0.0
         self._pending_assistant_chunks = 0
 
+    def _close_assistant_turn(self) -> None:
+        self._assistant_turn_open = False
+        self._assistant_continuation_grace_remaining = 0
+
     def _should_send_vision(
         self,
         *,
@@ -659,11 +720,21 @@ class LocalDuplexRunner:
             return False
         if playback_active:
             return False
-        return self._vision_question_frame_pending and (
+        user_signal_active = (
             speech_detected
             or speech_activation_window_open
             or self._speech_recent_chunks_remaining > 0
         )
+        if not user_signal_active:
+            return False
+        if self._vision_question_frame_pending:
+            return True
+        if self.config.video.frame_interval_ms <= 0:
+            return False
+        if self._last_vision_frame_sent_monotonic <= 0:
+            return True
+        elapsed_ms = (time.monotonic() - self._last_vision_frame_sent_monotonic) * 1000.0
+        return elapsed_ms >= self.config.video.frame_interval_ms
 
     def _update_user_turn_state(
         self,
@@ -854,6 +925,30 @@ class LocalDuplexRunner:
                 reason=reason,
                 chunk_index=chunk_index,
             )
+
+    @staticmethod
+    def _set_result_stop_metadata(result, *, stop_reason: str, backend_end_of_turn: bool, ended_with_listen: bool) -> None:
+        if hasattr(result, "stop_reason"):
+            result.stop_reason = stop_reason
+        if hasattr(result, "backend_end_of_turn"):
+            result.backend_end_of_turn = backend_end_of_turn
+        if hasattr(result, "ended_with_listen"):
+            result.ended_with_listen = ended_with_listen
+
+    @staticmethod
+    def _result_backend_end_of_turn(result) -> bool:
+        return bool(getattr(result, "backend_end_of_turn", getattr(result, "end_of_turn", False)))
+
+    @classmethod
+    def _result_stop_reason(cls, result) -> str:
+        stop_reason = str(getattr(result, "stop_reason", "") or "").strip()
+        if stop_reason:
+            return stop_reason
+        if result.is_listen:
+            return "listen"
+        if cls._result_backend_end_of_turn(result):
+            return "turn_eos"
+        return "chunk_pause"
 
     def _note_consistency_error(self, message: str) -> None:
         self._consistency_error_count += 1

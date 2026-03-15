@@ -4,31 +4,131 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_FILE="${1:-${ROOT_DIR}/.local_duplex/runtime.log}"
+LATEST_SESSION_FILE="${ROOT_DIR}/.local_duplex/latest_session"
+DEFAULT_TARGET="${ROOT_DIR}/.local_duplex/runtime.log"
 
-if [ ! -f "${LOG_FILE}" ]; then
-  echo "Log file not found: ${LOG_FILE}" >&2
+if [ -f "${LATEST_SESSION_FILE}" ]; then
+  LATEST_SESSION="$(cat "${LATEST_SESSION_FILE}")"
+  if [ -d "${LATEST_SESSION}" ]; then
+    DEFAULT_TARGET="${LATEST_SESSION}"
+  fi
+fi
+
+TARGET_PATH="${1:-${DEFAULT_TARGET}}"
+
+if [ ! -e "${TARGET_PATH}" ]; then
+  echo "Target not found: ${TARGET_PATH}" >&2
   exit 1
 fi
 
-python3 - "${ROOT_DIR}" "${LOG_FILE}" <<'PYEOF'
+python3 - "${ROOT_DIR}" "${TARGET_PATH}" <<'PYEOF'
 import json
 from pathlib import Path
 import re
 import sys
-from collections import defaultdict
 
 root_dir = Path(sys.argv[1])
-log_path = sys.argv[2]
+target_path = Path(sys.argv[2])
 config_path = root_dir / "configs" / "local_duplex.json"
 
 chunk_budget_ms = 1000
+runtime_speak_budget_ms = 1000
 if config_path.exists():
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         chunk_budget_ms = int(config.get("audio", {}).get("chunk_ms", chunk_budget_ms))
+        runtime_speak_budget_ms = int(config.get("runtime", {}).get("speak_latency_budget_ms", runtime_speak_budget_ms))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
+
+sep = "=" * 72
+thin = "-" * 72
+
+
+def print_structured_summary(summary: dict) -> None:
+    print(sep)
+    print("  LOCAL DUPLEX INTERACTION LOG")
+    print(sep)
+    print()
+    print("SESSION OVERVIEW")
+    print(thin)
+    print(f"  Total chunks processed:   {summary.get('total_chunks', 0)}")
+    print(f"  Listen chunks:            {summary.get('listen_chunks', 0)}")
+    print(f"  Speak chunks:             {summary.get('speak_chunks', 0)}")
+    print(f"  Session resets:           {summary.get('reset_count', 0)}")
+    print(f"  Interrupts:               {summary.get('barge_in_count', 0)}")
+    print(f"  Vision frames sent:       {summary.get('vision_chunks', 0)}")
+    print()
+
+    print("PERFORMANCE")
+    print(thin)
+    if summary.get("avg_speak_latency_ms") is not None:
+        print(f"  Speak latency:  avg={summary['avg_speak_latency_ms']:.0f}ms")
+    if summary.get("avg_listen_latency_ms") is not None:
+        print(f"  Listen latency: avg={summary['avg_listen_latency_ms']:.0f}ms")
+    print(
+        f"  Speak chunks exceeding {int(summary.get('speak_latency_budget_ms', chunk_budget_ms))}ms budget: "
+        f"{summary.get('speak_over_budget_chunks', 0)}/{summary.get('speak_chunks', 0)}"
+    )
+    print()
+
+    print("CONVERSATION FLOW")
+    print(thin)
+    for event in summary.get("conversation_flow", []):
+        ts = event.get("ts", "")
+        time_part = ts.split("T")[-1][:12] if "T" in ts else ts
+        if event.get("kind") == "user":
+            print(
+                f"  {time_part}  >> [User speaking] {event.get('speech_chunks', 0)} chunks "
+                f"(chunks {event.get('chunk_start')}-{event.get('chunk_end')}), avg_rms={event.get('avg_rms', 0.0):.4f}"
+            )
+        elif event.get("kind") == "assistant":
+            stop_reasons = ",".join(event.get("stop_reasons", []))
+            print(
+                f"  {time_part}  << [Model speaking] \"{event.get('text', '')}\" "
+                f"({event.get('chunk_end', 0) - event.get('chunk_start', 0) + 1} chunks, "
+                f"avg_lat={event.get('avg_latency_ms', 0.0):.0f}ms, stop_reason={stop_reasons})"
+            )
+        else:
+            print(f"  {time_part}  -- {event.get('message', '')}")
+    print()
+
+    print("VISION USAGE")
+    print(thin)
+    vision_chunks = summary.get("vision_chunks", 0)
+    if vision_chunks:
+        print(f"  Vision frames fed to model: {vision_chunks}")
+    else:
+        print("  Vision was not active during this session.")
+    print()
+
+
+def load_structured_summary(path: Path) -> dict | None:
+    session_dir = None
+    if path.is_dir():
+        session_dir = path
+    elif path.name == "summary.json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    elif path.name == "interaction.jsonl":
+        session_dir = path.parent
+
+    if session_dir is None:
+        return None
+
+    summary_path = session_dir / "summary.json"
+    if not summary_path.exists():
+        return None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["speak_latency_budget_ms"] = int(summary.get("speak_latency_budget_ms") or runtime_speak_budget_ms)
+    return summary
+
+
+structured_summary = load_structured_summary(target_path)
+if structured_summary is not None:
+    print_structured_summary(structured_summary)
+    raise SystemExit(0)
+
+log_path = target_path
 
 # Patterns
 RE_INPUT = re.compile(
@@ -136,10 +236,6 @@ if user_speech_chunks:
             user_speech_segs.append(seg)
             seg = [user_speech_chunks[i]]
     user_speech_segs.append(seg)
-
-# Output
-sep = "=" * 72
-thin = "-" * 72
 
 print(sep)
 print("  LOCAL DUPLEX INTERACTION LOG")

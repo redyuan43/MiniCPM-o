@@ -175,6 +175,11 @@ class InteractionSessionLogger:
                 "state": "listen" if result.is_listen else "speak",
                 "text": result_text,
                 "end_of_turn": bool(result.end_of_turn),
+                "backend_end_of_turn": bool(
+                    getattr(result, "backend_end_of_turn", getattr(result, "end_of_turn", False))
+                ),
+                "ended_with_listen": bool(getattr(result, "ended_with_listen", False)),
+                "stop_reason": str(getattr(result, "stop_reason", "") or "empty"),
                 "audio_path": ai_audio_rel,
                 "audio_duration_ms": ai_audio_duration_ms,
             },
@@ -201,7 +206,10 @@ class InteractionSessionLogger:
                 ),
             },
             "analysis": {
-                "fragmented_speech": bool(not result.is_listen and not result.end_of_turn),
+                "fragmented_speech": bool(
+                    not result.is_listen
+                    and not getattr(result, "backend_end_of_turn", getattr(result, "end_of_turn", False))
+                ),
                 "barge_in_detected": barge_in_detected,
                 "reset_after_chunk": reset_reason,
                 "session_health": session_health,
@@ -346,6 +354,7 @@ class InteractionSessionLogger:
             "model_variant": (
                 self.config.model.gguf_variant if self.config.model.backend == "gguf" else "awq"
             ),
+            "gguf_variant": self.config.model.gguf_variant if self.config.model.backend == "gguf" else None,
             "session_dir": str(self.session_dir),
             "started_at": self._events[0]["ts"] if self._events else self._now_iso(),
             "total_chunks": len(chunk_events),
@@ -370,6 +379,8 @@ class InteractionSessionLogger:
             "avg_worker_decode_ms": self._avg(worker_decode_latencies),
             "avg_worker_wav_wait_ms": self._avg(worker_wav_wait_latencies),
             "avg_worker_trailing_wait_ms": self._avg(worker_trailing_wait_latencies),
+            "speak_latency_budget_ms": self.config.runtime.speak_latency_budget_ms,
+            "listen_latency_budget_ms": self.config.runtime.listen_latency_budget_ms,
             "assistant_turn_count": len(assistant_turns),
             "avg_chunks_per_assistant_turn": self._avg(
                 [turn["chunk_end"] - turn["chunk_start"] + 1 for turn in assistant_turns]
@@ -430,6 +441,7 @@ class InteractionSessionLogger:
                     "audio_duration_ms": sum(event["assistant"]["audio_duration_ms"] for event in assistant_segment),
                     "vision_used": any(event["vision"]["used"] for event in assistant_segment),
                     "fragmented": any(event["analysis"]["fragmented_speech"] for event in assistant_segment),
+                    "stop_reasons": [event["assistant"]["stop_reason"] for event in assistant_segment],
                 }
             )
             assistant_segment = []
@@ -515,6 +527,7 @@ class InteractionSessionLogger:
             f"- Mode: `{summary['mode']}`",
             f"- Backend: `{summary['backend']}`",
             f"- Model Variant: `{summary['model_variant']}`",
+            f"- GGUF Variant: `{summary['gguf_variant'] or 'n/a'}`",
             f"- Session Dir: `{summary['session_dir']}`",
             "",
             "## Overview",
@@ -573,7 +586,8 @@ class InteractionSessionLogger:
                         f"avg_latency={self._format_number(event['avg_latency_ms'])} ms, "
                         f"audio={self._format_number(event['audio_duration_ms'])} ms, "
                         f"vision={'used' if event['vision_used'] else 'not used'}, "
-                        f"fragmented={'yes' if event['fragmented'] else 'no'})"
+                        f"fragmented={'yes' if event['fragmented'] else 'no'}, "
+                        f"stop_reason={','.join(event['stop_reasons'])})"
                     )
                 else:
                     lines.append(f"- `{stamp}` {event['message']}")
@@ -623,8 +637,12 @@ class InteractionSessionLogger:
         )
         if latency_ms > latency_budget_ms:
             causes.append("latency_over_budget")
-        if not result.is_listen and not result.end_of_turn:
+        backend_end_of_turn = bool(getattr(result, "backend_end_of_turn", getattr(result, "end_of_turn", False)))
+        if not result.is_listen and not backend_end_of_turn:
             causes.append("continuing_turn")
+        stop_reason = str(getattr(result, "stop_reason", "") or "")
+        if stop_reason == "chunk_limit":
+            causes.append("chunk_limit")
         if result.n_tokens and result.n_tokens >= self.config.session.max_new_speak_tokens_per_chunk:
             causes.append("token_budget")
         return causes

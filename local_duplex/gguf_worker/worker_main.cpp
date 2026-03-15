@@ -55,6 +55,17 @@ struct WavCollectResult {
     int trailing_wait_ms = 0;
 };
 
+struct DoneFlagSnapshot {
+    bool exists = false;
+    int last_wav_index = -1;
+    fs::file_time_type mtime{};
+};
+
+struct DoneFlagWaitResult {
+    DoneFlagSnapshot snapshot;
+    int waited_ms = 0;
+};
+
 std::optional<int> parse_wav_index(const fs::path & path) {
     const std::string name = path.filename().string();
     if (name.size() < 9 || name.rfind("wav_", 0) != 0 || name.substr(name.size() - 4) != ".wav") {
@@ -95,6 +106,94 @@ int scan_highest_wav_index(const std::string & base_output_dir) {
         highest = std::max(highest, item.first);
     }
     return highest;
+}
+
+DoneFlagSnapshot read_done_flag_snapshot(const std::string & base_output_dir) {
+    const fs::path done_flag_path = fs::path(base_output_dir) / "tts_wav" / "generation_done.flag";
+    if (!fs::exists(done_flag_path)) {
+        return {};
+    }
+    std::ifstream input(done_flag_path);
+    int last_wav_index = -1;
+    if (!(input >> last_wav_index)) {
+        last_wav_index = -1;
+    }
+    return {
+        true,
+        last_wav_index,
+        fs::last_write_time(done_flag_path),
+    };
+}
+
+DoneFlagWaitResult wait_for_done_flag_update(
+    const std::string & base_output_dir,
+    const DoneFlagSnapshot & baseline,
+    int max_wait_ms
+) {
+    constexpr int kPollMs = 20;
+    const auto start = std::chrono::steady_clock::now();
+    auto latest = read_done_flag_snapshot(base_output_dir);
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start
+    ).count() < max_wait_ms) {
+        latest = read_done_flag_snapshot(base_output_dir);
+        const bool updated =
+            latest.exists &&
+            (
+                !baseline.exists ||
+                latest.mtime != baseline.mtime ||
+                latest.last_wav_index != baseline.last_wav_index
+            );
+        if (updated) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+    }
+    latest = read_done_flag_snapshot(base_output_dir);
+    return {
+        latest,
+        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start
+        ).count()),
+    };
+}
+
+WavWaitResult wait_for_wavs_through_index(
+    const std::string & base_output_dir,
+    int & last_seen_wav_index,
+    int target_last_wav_index,
+    int max_wait_ms
+) {
+    constexpr int kPollMs = 20;
+    auto best = scan_new_wavs(base_output_dir, last_seen_wav_index);
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start
+    ).count() < max_wait_ms) {
+        auto current = scan_new_wavs(base_output_dir, last_seen_wav_index);
+        if (current.size() > best.size()) {
+            best = std::move(current);
+        } else if (!current.empty() && (!best.empty() ? current.back().first > best.back().first : true)) {
+            best = std::move(current);
+        }
+        const int highest_seen = best.empty() ? last_seen_wav_index : best.back().first;
+        if (highest_seen >= target_last_wav_index) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+    }
+
+    std::vector<std::string> paths;
+    for (const auto & item : best) {
+        last_seen_wav_index = std::max(last_seen_wav_index, item.first);
+        paths.push_back(item.second);
+    }
+    return {
+        std::move(paths),
+        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start
+        ).count()),
+    };
 }
 
 WavWaitResult wait_for_new_wavs(
@@ -152,7 +251,9 @@ WavWaitResult wait_for_new_wavs(
 
 WavCollectResult collect_generate_wavs(
     WorkerState & state,
-    bool end_of_turn
+    bool end_of_turn,
+    bool wait_for_done_flag,
+    const DoneFlagSnapshot & done_flag_baseline
 ) {
     auto wav_result = wait_for_new_wavs(
         state.base_output_dir,
@@ -185,10 +286,39 @@ WavCollectResult collect_generate_wavs(
         trailing_result.paths.begin(),
         trailing_result.paths.end()
     );
+    int extra_trailing_wait_ms = trailing_result.waited_ms;
+
+    // End-of-turn audio is only complete after token2wav writes generation_done.flag.
+    // Without this, the last 1-2 wav files can land after we have already returned.
+    if (wait_for_done_flag) {
+        const auto done_flag_result = wait_for_done_flag_update(
+            state.base_output_dir,
+            done_flag_baseline,
+            state.final_speek_wait_ms
+        );
+        extra_trailing_wait_ms += done_flag_result.waited_ms;
+        if (
+            done_flag_result.snapshot.exists &&
+            done_flag_result.snapshot.last_wav_index > state.last_seen_wav_index
+        ) {
+            auto final_wav_result = wait_for_wavs_through_index(
+                state.base_output_dir,
+                state.last_seen_wav_index,
+                done_flag_result.snapshot.last_wav_index,
+                state.final_speek_wait_ms
+            );
+            wav_result.paths.insert(
+                wav_result.paths.end(),
+                final_wav_result.paths.begin(),
+                final_wav_result.paths.end()
+            );
+            extra_trailing_wait_ms += final_wav_result.waited_ms;
+        }
+    }
     return {
         std::move(wav_result.paths),
         wav_result.waited_ms,
-        trailing_result.waited_ms,
+        extra_trailing_wait_ms,
     };
 }
 
@@ -383,6 +513,7 @@ json handle_generate(WorkerState & state, const json & req) {
         throw std::runtime_error("worker is not prepared");
     }
     state.ctx->listen_prob_scale = req.value("listen_prob_scale", state.ctx->listen_prob_scale);
+    const auto done_flag_baseline = read_done_flag_snapshot(state.base_output_dir);
     const auto started = std::chrono::steady_clock::now();
     const bool ok = stream_decode(state.ctx, (fs::path(state.base_output_dir) / "llm_debug").string(), -1);
     const auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -396,6 +527,11 @@ json handle_generate(WorkerState & state, const json & req) {
     bool end_of_turn = false;
     std::string text;
     drain_text_queue(state.ctx, is_listen, end_of_turn, text);
+    const std::string stop_reason = !state.ctx->duplex_last_stop_reason.empty()
+        ? state.ctx->duplex_last_stop_reason
+        : (is_listen ? "listen" : (end_of_turn ? "turn_eos" : "empty"));
+    const bool backend_end_of_turn = state.ctx->duplex_last_backend_end_of_turn;
+    const bool ended_with_listen = state.ctx->ended_with_listen.load();
     const bool followup_tail_scan =
         !end_of_turn && is_listen && text.empty() && state.pending_tail_scan_chunks > 0;
     const int final_speek_wait_ms = (end_of_turn && state.ctx != nullptr && !state.ctx->speek_done)
@@ -404,7 +540,7 @@ json handle_generate(WorkerState & state, const json & req) {
     const bool should_collect_wavs =
         !is_listen || end_of_turn || !text.empty() || followup_tail_scan;
     const auto wav_result = should_collect_wavs
-        ? collect_generate_wavs(state, end_of_turn || followup_tail_scan)
+        ? collect_generate_wavs(state, end_of_turn || followup_tail_scan, end_of_turn, done_flag_baseline)
         : WavCollectResult{};
     if (end_of_turn) {
         state.pending_tail_scan_chunks = 2;
@@ -426,6 +562,9 @@ json handle_generate(WorkerState & state, const json & req) {
         {"chunk_index", used_chunk_index},
         {"is_listen", is_listen},
         {"end_of_turn", end_of_turn},
+        {"backend_end_of_turn", backend_end_of_turn},
+        {"ended_with_listen", ended_with_listen},
+        {"stop_reason", stop_reason},
         {"text", text},
         {"audio_wav_paths", wav_result.paths},
         {"decode_ms", decode_ms},
@@ -433,8 +572,8 @@ json handle_generate(WorkerState & state, const json & req) {
         {"wav_wait_ms", wav_result.wav_wait_ms},
         {"trailing_wait_ms", wav_result.trailing_wait_ms},
         {"cost_all_ms", cost_all_ms},
-        {"n_tokens", nullptr},
-        {"n_tts_tokens", nullptr},
+        {"n_tokens", 0},
+        {"n_tts_tokens", 0},
     };
 }
 

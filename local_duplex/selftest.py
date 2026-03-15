@@ -552,33 +552,6 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def _json_value(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _flatten_overrides(prefix: str, value: Any, out: dict[str, Any]) -> None:
-    if isinstance(value, dict):
-        for child_key, child_value in value.items():
-            _flatten_overrides(child_key, child_value, out)
-        return
-    out[prefix] = value
-
-
-def _sync_python_defaults(overrides: dict[str, Any]) -> None:
-    config_py = (PROJECT_ROOT / "local_duplex/config.py").read_text(encoding="utf-8")
-    flat: dict[str, Any] = {}
-    for key, value in overrides.items():
-        _flatten_overrides(key, value, flat)
-    updated = config_py
-    for key, value in flat.items():
-        pattern = re.compile(rf'("{re.escape(key)}":\s*)([^,\n]+)')
-        replacement = _json_value(value)
-        updated, count = pattern.subn(lambda match: f"{match.group(1)}{replacement}", updated, count=1)
-        if count == 0:
-            raise RuntimeError(f"Unable to sync local_duplex/config.py for key: {key}")
-    (PROJECT_ROOT / "local_duplex/config.py").write_text(updated, encoding="utf-8")
-
-
 def _write_overlay_config(run_dir: Path, overrides: dict[str, Any]) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     config = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -1127,13 +1100,6 @@ def _render_final_summary(
     return path
 
 
-def _apply_best_overrides(overrides: dict[str, Any]) -> None:
-    config = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
-    merged = _deep_merge(config, overrides)
-    DEFAULT_CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _sync_python_defaults(overrides)
-
-
 def _run_search(
     *,
     run_dir: Path,
@@ -1214,9 +1180,6 @@ def main() -> int:
         scenarios=selected_scenarios,
         tune=args.tune,
     )
-
-    if args.tune and best_overrides:
-        _apply_best_overrides(best_overrides)
 
     final_summary = _render_final_summary(
         run_dir=run_dir,
