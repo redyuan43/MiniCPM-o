@@ -9,17 +9,17 @@ from pathlib import Path
 import os
 import sys
 
-
-CAPSWRITER_ROOT = Path("/home/ivan/github/CapsWriter-Offline-Windows-64bit")
-HTTP_API_SERVER = CAPSWRITER_ROOT / "http_api_server.py"
+from local_duplex.host_paths import require_capswriter_root
 
 
 def _load_capswriter_module():
-    os.chdir(CAPSWRITER_ROOT)
-    sys.path.insert(0, str(CAPSWRITER_ROOT))
-    spec = importlib.util.spec_from_file_location("cw_http_api_server", HTTP_API_SERVER)
+    capswriter_root = require_capswriter_root()
+    http_api_server = capswriter_root / "http_api_server.py"
+    os.chdir(capswriter_root)
+    sys.path.insert(0, str(capswriter_root))
+    spec = importlib.util.spec_from_file_location("cw_http_api_server", http_api_server)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load CapsWriter module from {HTTP_API_SERVER}")
+        raise RuntimeError(f"Unable to load CapsWriter module from {http_api_server}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

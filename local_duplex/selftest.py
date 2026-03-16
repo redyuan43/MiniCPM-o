@@ -27,6 +27,7 @@ from local_duplex.audio import (
     resolve_playback_device,
 )
 from local_duplex.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, load_runtime_config
+from local_duplex.host_paths import require_capswriter_python
 
 try:
     import sounddevice as sd
@@ -41,11 +42,11 @@ except ImportError:  # pragma: no cover
 
 RUNTIME_DIR = PROJECT_ROOT / ".local_duplex"
 SELFTEST_DIR = RUNTIME_DIR / "selftest"
-CAPSWRITER_VENV_PYTHON = Path("/home/ivan/github/CapsWriter-Offline-Windows-64bit/venv-asr/bin/python")
 CAPSWRITER_ASR_CLI = PROJECT_ROOT / "local_duplex/capswriter_asr_cli.py"
 START_SCRIPT = PROJECT_ROOT / "scripts/start_local_duplex.sh"
 STOP_SCRIPT = PROJECT_ROOT / "scripts/stop_local_duplex.sh"
 DEFAULT_EDGE_TTS_VOICE = "zh-CN-XiaoxiaoNeural"
+PIPEWIRE_VOLUME_TOKENS = {"pipewire", "default", ""}
 
 
 @dataclass(slots=True)
@@ -598,6 +599,116 @@ def _run(cmd: list[str], *, env: dict[str, str] | None = None, check: bool = Tru
     return result
 
 
+def _uses_pipewire_audio(device_selector: str | None) -> bool:
+    selector = (device_selector or "").strip().lower()
+    return selector in PIPEWIRE_VOLUME_TOKENS
+
+
+def _parse_wpctl_volume(stdout: str) -> float | None:
+    match = re.search(r"Volume:\s*([0-9]+(?:\.[0-9]+)?)", stdout)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _pipewire_volume_report(name: str, target: str) -> dict[str, Any]:
+    result = _run(["wpctl", "get-volume", target], check=False)
+    return {
+        "name": name,
+        "target": target,
+        "ok": result.returncode == 0,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+        "volume": _parse_wpctl_volume(result.stdout),
+    }
+
+
+def _ensure_pipewire_min_volume(
+    *,
+    name: str,
+    target: str,
+    minimum: float,
+) -> dict[str, Any]:
+    before = _pipewire_volume_report(name, target)
+    report = {
+        "name": name,
+        "target": target,
+        "minimum": minimum,
+        "before": before,
+        "changed": False,
+        "after": before,
+        "error": "",
+    }
+    if not before["ok"]:
+        report["error"] = before["stderr"] or f"wpctl get-volume failed for {target}"
+        return report
+    current_volume = before["volume"]
+    if current_volume is None:
+        report["error"] = f"Unable to parse volume from: {before['stdout']}"
+        return report
+    if current_volume >= minimum:
+        return report
+    result = _run(["wpctl", "set-volume", target, f"{minimum:.3f}"], check=False)
+    if result.returncode != 0:
+        report["error"] = result.stderr.strip() or f"wpctl set-volume failed for {target}"
+        return report
+    report["changed"] = True
+    report["after"] = _pipewire_volume_report(name, target)
+    return report
+
+
+def _prepare_pipewire_audio_loop(*, capture_device: str, playback_device: str, run_dir: Path) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": False,
+        "reason": "",
+        "sink": {},
+        "source": {},
+    }
+    if not (_uses_pipewire_audio(capture_device) and _uses_pipewire_audio(playback_device)):
+        report["reason"] = "capture/playback are not both PipeWire-backed defaults"
+        return report
+    if os.environ.get("LOCAL_DUPLEX_SELFTEST_FIX_PIPEWIRE_VOLUME", "1").strip().lower() in {"0", "false", "no"}:
+        report["reason"] = "disabled by LOCAL_DUPLEX_SELFTEST_FIX_PIPEWIRE_VOLUME"
+        return report
+    wpctl_path = subprocess.run(["bash", "-lc", "command -v wpctl"], check=False, capture_output=True, text=True)
+    if wpctl_path.returncode != 0:
+        report["reason"] = "wpctl is not available"
+        return report
+
+    sink_min = float(os.environ.get("LOCAL_DUPLEX_SELFTEST_MIN_SINK_VOLUME", "1.0"))
+    source_min = float(os.environ.get("LOCAL_DUPLEX_SELFTEST_MIN_SOURCE_VOLUME", "1.0"))
+    report["enabled"] = True
+    report["sink"] = _ensure_pipewire_min_volume(
+        name="default_sink",
+        target="@DEFAULT_AUDIO_SINK@",
+        minimum=sink_min,
+    )
+    report["source"] = _ensure_pipewire_min_volume(
+        name="default_source",
+        target="@DEFAULT_AUDIO_SOURCE@",
+        minimum=source_min,
+    )
+
+    report_path = run_dir / "audio_preflight.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    for endpoint in (report["sink"], report["source"]):
+        before = endpoint.get("before", {})
+        after = endpoint.get("after", {})
+        before_volume = before.get("volume")
+        after_volume = after.get("volume")
+        if endpoint.get("error"):
+            print(f"Audio preflight {endpoint['name']}: {endpoint['error']}")
+            continue
+        if endpoint.get("changed"):
+            print(
+                f"Audio preflight {endpoint['name']}: raised volume from {before_volume} to {after_volume}"
+            )
+        else:
+            print(f"Audio preflight {endpoint['name']}: volume={after_volume}")
+    return report
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
@@ -797,9 +908,10 @@ def _tail_similarity(expected: str, actual: str, tail_chars: int = 8) -> float:
 
 
 def _transcribe_wav_with_capswriter(wav_path: Path) -> dict[str, Any]:
+    capswriter_python = require_capswriter_python()
     result = _run(
         [
-            str(CAPSWRITER_VENV_PYTHON),
+            str(capswriter_python),
             str(CAPSWRITER_ASR_CLI),
             str(wav_path),
         ]
@@ -1542,8 +1654,7 @@ def _run_search(
     for index, overrides in enumerate(candidates):
         candidate_dir = run_dir / f"candidate_{index:02d}"
         candidate_results: list[ScenarioResult] = []
-        selected_scenarios = scenarios if tune else scenarios[:1]
-        for scenario in selected_scenarios:
+        for scenario in scenarios:
             candidate_results.append(
                 _run_single_scenario(
                     run_dir=candidate_dir,
@@ -1599,6 +1710,11 @@ def main() -> int:
     run_id = time.strftime("%Y%m%d-%H%M%S")
     run_dir = SELFTEST_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_pipewire_audio_loop(
+        capture_device=base_config.audio.capture_device,
+        playback_device=base_config.audio.playback_device,
+        run_dir=run_dir,
+    )
 
     best_overrides, best_results = _run_search(
         run_dir=run_dir,

@@ -527,10 +527,10 @@ json handle_generate(WorkerState & state, const json & req) {
     bool end_of_turn = false;
     std::string text;
     drain_text_queue(state.ctx, is_listen, end_of_turn, text);
-    const std::string stop_reason = !state.ctx->duplex_last_stop_reason.empty()
-        ? state.ctx->duplex_last_stop_reason
-        : (is_listen ? "listen" : (end_of_turn ? "turn_eos" : "empty"));
-    const bool backend_end_of_turn = state.ctx->duplex_last_backend_end_of_turn;
+    // Recent llama.cpp-omni no longer exposes duplex_last_* fields on omni_context.
+    // Reconstruct the worker-facing metadata from the text queue markers instead.
+    const std::string stop_reason = is_listen ? "listen" : (end_of_turn ? "turn_eos" : "empty");
+    const bool backend_end_of_turn = end_of_turn;
     const bool ended_with_listen = state.ctx->ended_with_listen.load();
     const bool followup_tail_scan =
         !end_of_turn && is_listen && text.empty() && state.pending_tail_scan_chunks > 0;

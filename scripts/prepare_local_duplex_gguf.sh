@@ -5,9 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_DIR="${ROOT_DIR}/third_party/models/modelscope/MiniCPM-o-4_5-gguf"
 REPO_ID="OpenBMB/MiniCPM-o-4_5-gguf"
 VARIANT="${1:-Q4_K_M}"
+VENV_DIR="${ROOT_DIR}/.venv/local-duplex311"
 
 if command -v "modelscope" >/dev/null 2>&1; then
   MODELSCOPE_BIN="$(command -v "modelscope")"
+elif [ -x "${VENV_DIR}/bin/modelscope" ]; then
+  MODELSCOPE_BIN="${VENV_DIR}/bin/modelscope"
 elif [ -x "${HOME}/.local/bin/modelscope" ]; then
   MODELSCOPE_BIN="${HOME}/.local/bin/modelscope"
 else

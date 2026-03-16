@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -241,11 +244,70 @@ def _resolve_path(path: str) -> str:
     return str((PROJECT_ROOT / candidate).resolve())
 
 
+def _apply_env_overrides(merged: dict[str, Any]) -> None:
+    env_override_map = {
+        ("audio", "capture_device"): ("LOCAL_DUPLEX_CAPTURE_DEVICE",),
+        ("audio", "playback_device"): ("LOCAL_DUPLEX_PLAYBACK_DEVICE",),
+        ("video", "camera_device"): ("LOCAL_DUPLEX_CAMERA_DEVICE",),
+    }
+    for (section, key), env_keys in env_override_map.items():
+        for env_key in env_keys:
+            value = os.environ.get(env_key, "").strip()
+            if value:
+                merged[section][key] = value
+                break
+
+
+def _discover_camera_device(configured_path: str) -> str:
+    resolved_configured = _resolve_path(configured_path)
+    if Path(resolved_configured).exists():
+        return resolved_configured
+
+    by_id_dir = Path("/dev/v4l/by-id")
+    candidates = []
+    if by_id_dir.exists():
+        candidates = sorted(
+            path
+            for path in by_id_dir.iterdir()
+            if path.is_symlink() and path.name.endswith("video-index0")
+        )
+
+    preferred_fragments: list[str] = []
+    hint_text = os.environ.get("LOCAL_DUPLEX_CAMERA_HINTS", "").strip().lower()
+    if hint_text:
+        preferred_fragments.extend([item.strip() for item in hint_text.split(",") if item.strip()])
+
+    configured_name = Path(configured_path).name.lower()
+    if "brio" in configured_name or "logitech" in configured_name:
+        preferred_fragments.extend(["logitech", "brio", "emeet", "pixy"])
+    else:
+        preferred_fragments.extend(
+            token
+            for token in re.findall(r"[a-z0-9]{4,}", configured_name)
+            if token not in {"video", "index0"}
+        )
+
+    for fragment in preferred_fragments:
+        for candidate in candidates:
+            if fragment in candidate.name.lower():
+                return str(candidate)
+
+    if candidates:
+        return str(candidates[0])
+
+    for fallback in (Path("/dev/video0"), Path("/dev/video1")):
+        if fallback.exists():
+            return str(fallback)
+
+    return resolved_configured
+
+
 def load_runtime_config(path: str | None = None) -> DuplexRuntimeConfig:
-    merged = dict(DEFAULT_CONFIG)
+    merged = deepcopy(DEFAULT_CONFIG)
     if path:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         merged = _deep_merge(merged, raw)
+    _apply_env_overrides(merged)
 
     merged["audio"]["reference_audio_path"] = _resolve_path(merged["audio"]["reference_audio_path"])
     if merged["model"]["model_path"].startswith(("/", ".")):
@@ -261,6 +323,7 @@ def load_runtime_config(path: str | None = None) -> DuplexRuntimeConfig:
         "gguf_worker_bin",
     ):
         merged["model"][key] = _resolve_path(merged["model"][key])
+    merged["video"]["camera_device"] = _discover_camera_device(merged["video"]["camera_device"])
 
     return DuplexRuntimeConfig(
         model=ModelConfig(**merged["model"]),
