@@ -106,6 +106,8 @@ class LocalDuplexRunner:
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
+        self._pending_playback_commit = False
+        self._last_observed_playback_active = False
 
     def run(self) -> None:
         self._preflight()
@@ -130,6 +132,10 @@ class LocalDuplexRunner:
                 playback_active = self.playback.active
                 playback_active_ms = self.playback.active_duration_ms
                 playback_remaining_ms = self.playback.remaining_ms
+                if self._pending_playback_commit and self._last_observed_playback_active and not playback_active:
+                    if self._backend.commit_played_output():
+                        LOGGER.info("Committed played assistant boundary before next decode")
+                    self._pending_playback_commit = False
                 self.capture.set_playback_state(
                     playback_active,
                     playback_active_ms,
@@ -207,6 +213,7 @@ class LocalDuplexRunner:
                     self._barge_in_listen_lock = True
                     self._barge_in_release_silent_chunks_remaining = POST_BARGE_IN_RELEASE_SILENT_CHUNKS
                     barge_in_listen_lock_active = True
+                    self._pending_playback_commit = False
                     self._interrupted_assistant_reference_text = "".join(self._recent_assistant_fragments[-12:])
                     self._close_assistant_turn()
                     self.playback.clear()
@@ -268,11 +275,22 @@ class LocalDuplexRunner:
                 chunk_start = time.perf_counter()
                 try:
                     effective_frame_list, prefill_ms = self._prefill_with_fallback(effective_audio_chunk, frame_list)
-                    result, model_decision_bias = self._generate_with_speech_bias(
+                    if self._should_defer_generation_during_playback(
+                        speech_detected=speech_detected,
                         speech_activation_window_open=speech_activation_window_open,
                         playback_active=playback_active,
                         barge_in_listen_lock_active=barge_in_listen_lock_active,
-                    )
+                    ):
+                        model_decision_bias = "playback_generation_deferred"
+                        self._last_model_decision_bias = model_decision_bias
+                        result = self._backend.generate_deferred(stop_reason=model_decision_bias)
+                    else:
+                        result, model_decision_bias = self._generate_with_speech_bias(
+                            speech_detected=speech_detected,
+                            speech_activation_window_open=speech_activation_window_open,
+                            playback_active=playback_active,
+                            barge_in_listen_lock_active=barge_in_listen_lock_active,
+                        )
                     result = self._apply_force_listen_guard(result)
                     result, unsolicited_speak_suppressed = self._apply_unsolicited_speak_guard(
                         result=result,
@@ -353,6 +371,10 @@ class LocalDuplexRunner:
                         self._recent_assistant_fragments.append(str(result.text))
                         if len(self._recent_assistant_fragments) > 12:
                             self._recent_assistant_fragments = self._recent_assistant_fragments[-12:]
+                    if result.audio_data and not backend_end_of_turn:
+                        self._pending_playback_commit = True
+                    elif backend_end_of_turn:
+                        self._pending_playback_commit = False
                 if speech_detected or playback_active:
                     self._last_interaction_monotonic = time.monotonic()
                 self._update_assistant_turn_state(result)
@@ -401,6 +423,7 @@ class LocalDuplexRunner:
                     )
 
                 chunk_index += 1
+                self._last_observed_playback_active = self.playback.active
         finally:
             self.stop()
 
@@ -620,10 +643,29 @@ class LocalDuplexRunner:
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
+        self._pending_playback_commit = False
+        self._last_observed_playback_active = False
         self._set_session_health("healthy", f"reset_complete:{reason}", chunk_index)
+
+    def _should_defer_generation_during_playback(
+        self,
+        *,
+        speech_detected: bool,
+        speech_activation_window_open: bool,
+        playback_active: bool,
+        barge_in_listen_lock_active: bool,
+    ) -> bool:
+        if not playback_active or barge_in_listen_lock_active:
+            return False
+        if speech_detected or speech_activation_window_open or self._user_turn_active:
+            return False
+        if self._pending_interrupt_ack:
+            return False
+        return True
 
     def _generate_with_speech_bias(
         self,
+        speech_detected: bool,
         speech_activation_window_open: bool,
         playback_active: bool,
         barge_in_listen_lock_active: bool,
@@ -644,6 +686,14 @@ class LocalDuplexRunner:
             and self._assistant_turn_open
             and self._assistant_continuation_grace_remaining > 0
         )
+        use_interrupt_ack_bias = (
+            not force_listen_active
+            and not playback_active
+            and not barge_in_listen_lock_active
+            and self._pending_interrupt_ack
+            and not self._user_turn_active
+            and not speech_detected
+        )
         model_decision_bias = "default"
         listen_prob_scale_override: float | None = None
         if force_listen_active:
@@ -652,6 +702,13 @@ class LocalDuplexRunner:
         elif barge_in_listen_lock_active:
             listen_prob_scale_override = max(self.config.session.listen_prob_scale, 2.0)
             model_decision_bias = "barge_in_listen_lock"
+        elif use_interrupt_ack_bias:
+            listen_prob_scale_override = min(
+                self.config.session.listen_prob_scale,
+                self.config.session.speech_eager_listen_prob_scale,
+                0.2,
+            )
+            model_decision_bias = "interrupt_ack"
         elif use_continuation_bias:
             listen_prob_scale_override = min(
                 self.config.session.listen_prob_scale,
@@ -889,6 +946,8 @@ class LocalDuplexRunner:
         self._pending_assistant_audio.clear()
         self._pending_assistant_audio_duration_ms = 0.0
         self._pending_assistant_chunks = 0
+        if not self.playback.active:
+            self._pending_playback_commit = False
 
     def _close_assistant_turn(self) -> None:
         self._assistant_turn_open = False
@@ -942,6 +1001,8 @@ class LocalDuplexRunner:
         text = str(result.text or "").strip()
         if not text or self._looks_like_interrupt_ack(text):
             return False
+        if self.config.runtime.strict_interrupt_ack:
+            return True
         return self._looks_like_stale_interrupted_reply(text)
 
     def _classify_barge_in(self) -> tuple[str, int]:

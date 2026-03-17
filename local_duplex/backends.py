@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -14,6 +15,19 @@ from local_duplex.vendor import import_duplex_core
 
 
 LOGGER = logging.getLogger("local_duplex.backend")
+
+
+def _make_listen_result(*, stop_reason: str, audio_data: str | None = None):
+    return SimpleNamespace(
+        is_listen=True,
+        text="",
+        audio_data=audio_data,
+        end_of_turn=False,
+        backend_end_of_turn=False,
+        ended_with_listen=True,
+        stop_reason=stop_reason,
+        current_time=0,
+    )
 
 
 class BaseDuplexBackend:
@@ -40,6 +54,12 @@ class BaseDuplexBackend:
 
     def generate(self, listen_prob_scale_override: float | None = None):
         raise NotImplementedError
+
+    def generate_deferred(self, stop_reason: str):
+        return _make_listen_result(stop_reason=stop_reason)
+
+    def commit_played_output(self) -> bool:
+        return False
 
     def finalize(self) -> None:
         raise NotImplementedError
@@ -223,6 +243,14 @@ class GgufDuplexBackend(BaseDuplexBackend):
     def generate(self, listen_prob_scale_override: float | None = None):
         assert self._client is not None
         return self._client.generate(listen_prob_scale_override)
+
+    def generate_deferred(self, stop_reason: str):
+        assert self._client is not None
+        return self._client.listen_tick(stop_reason=stop_reason)
+
+    def commit_played_output(self) -> bool:
+        assert self._client is not None
+        return self._client.commit_played_output()
 
     def finalize(self) -> None:
         return None

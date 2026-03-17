@@ -96,6 +96,20 @@ class ScenarioResult:
     metrics: dict[str, Any]
 
 
+@dataclass(slots=True)
+class LivePlanStage:
+    name: str
+    description: str
+    scenarios: list[str]
+
+
+@dataclass(slots=True)
+class LivePlan:
+    name: str
+    description: str
+    stages: list[LivePlanStage]
+
+
 PROMPTS: list[PromptScenario] = [
     PromptScenario(
         name="audio_short",
@@ -276,7 +290,7 @@ PROMPTS: list[PromptScenario] = [
                     "If the user interrupts you, stop quickly, give a very short acknowledgement, "
                     "and when asked to continue, resume from the first unfinished step instead of restarting from step one."
                 ),
-                "max_new_speak_tokens_per_chunk": 8,
+                "max_new_speak_tokens_per_chunk": 12,
             },
             "audio": {
                 "interrupt_rms_threshold": 0.02,
@@ -286,6 +300,7 @@ PROMPTS: list[PromptScenario] = [
             },
             "runtime": {
                 "assistant_continuation_grace_chunks": 14,
+                "strict_interrupt_ack": True,
                 "chunk_barge_in_rms_threshold": 0.018,
                 "chunk_barge_in_peak_threshold": 0.10,
                 "chunk_barge_in_consecutive_chunks": 1,
@@ -305,7 +320,7 @@ PROMPTS: list[PromptScenario] = [
                 prompt_text="停，只说收到。",
                 post_wait_s=8.0,
                 trigger="after_assistant_start",
-                trigger_playback_active_ms=200,
+                trigger_playback_active_ms=1200,
                 playback_gain=3.0,
             ),
             ScenarioStep(
@@ -539,6 +554,40 @@ SELFTEST_BASE_OVERRIDES: dict[str, Any] = {
         "speech_activation_chunks": 2,
         "speech_activation_min_rms": 0.015,
     }
+}
+
+SCENARIOS_BY_NAME: dict[str, PromptScenario] = {scenario.name: scenario for scenario in PROMPTS}
+
+LIVE_PLANS: dict[str, LivePlan] = {
+    "spark_interrupt_recovery": LivePlan(
+        name="spark_interrupt_recovery",
+        description=(
+            "Fix the remaining DGX Spark interrupt recovery path first, then regress long-form "
+            "interrupts, visual stability, and finally the full baseline."
+        ),
+        stages=[
+            LivePlanStage(
+                name="ordered_interrupt_gate",
+                description="Ordered steps interrupt/resume must pass before any broader regression.",
+                scenarios=["audio_ordered_steps_interrupt_resume"],
+            ),
+            LivePlanStage(
+                name="story_interrupt_regression",
+                description="Long-form single and multi-interrupt stories must remain stable after the interrupt fix.",
+                scenarios=["audio_story_interrupt", "audio_story_multi_interrupt"],
+            ),
+            LivePlanStage(
+                name="vision_stability_regression",
+                description="Vision stability must still hold before spending time on the full suite.",
+                scenarios=["omni_scene_stability", "omni_chat_fixed_scene"],
+            ),
+            LivePlanStage(
+                name="baseline_all",
+                description="Run the full baseline only after the targeted gates pass.",
+                scenarios=[scenario.name for scenario in PROMPTS],
+            ),
+        ],
+    ),
 }
 
 
@@ -1787,10 +1836,115 @@ def _run_search(
     return best_overrides, best_results
 
 
+def _run_live_plan(
+    *,
+    run_dir: Path,
+    plan: LivePlan,
+    capture_device: str,
+    playback_device: str,
+    tune: bool,
+) -> tuple[dict[str, Any], list[ScenarioResult], list[dict[str, Any]]]:
+    stage_reports: list[dict[str, Any]] = []
+    last_selected_overrides: dict[str, Any] = TUNING_CANDIDATES[0]
+    last_results: list[ScenarioResult] = []
+
+    for stage_index, stage in enumerate(plan.stages, start=1):
+        stage_dir = run_dir / f"stage_{stage_index:02d}_{stage.name}"
+        stage_scenarios = [SCENARIOS_BY_NAME[name] for name in stage.scenarios]
+        selected_overrides, stage_results = _run_search(
+            run_dir=stage_dir,
+            capture_device=capture_device,
+            playback_device=playback_device,
+            scenarios=stage_scenarios,
+            tune=tune,
+        )
+        stage_passed = all(result.passed for result in stage_results)
+        stage_reports.append(
+            {
+                "stage_index": stage_index,
+                "stage_name": stage.name,
+                "description": stage.description,
+                "run_dir": str(stage_dir),
+                "selected_overrides": selected_overrides,
+                "scenario_results": [asdict(result) for result in stage_results],
+                "passed": stage_passed,
+            }
+        )
+        last_selected_overrides = selected_overrides
+        last_results = stage_results
+        if not stage_passed:
+            break
+
+    return last_selected_overrides, last_results, stage_reports
+
+
+def _render_live_plan_summary(
+    *,
+    run_dir: Path,
+    plan: LivePlan,
+    stage_reports: list[dict[str, Any]],
+) -> Path:
+    lines = [
+        "# Local Duplex Live Plan Summary",
+        "",
+        f"- plan: `{plan.name}`",
+        f"- description: `{plan.description}`",
+        "",
+        "## Stage Results",
+        "",
+    ]
+    for stage_report in stage_reports:
+        lines.extend(
+            [
+                f"### Stage {stage_report['stage_index']}: {stage_report['stage_name']}",
+                f"- description: `{stage_report['description']}`",
+                f"- run_dir: `{stage_report['run_dir']}`",
+                f"- passed: `{stage_report['passed']}`",
+                "- selected_overrides:",
+                "```json",
+                json.dumps(stage_report["selected_overrides"], ensure_ascii=False, indent=2),
+                "```",
+                "",
+            ]
+        )
+        for result in stage_report["scenario_results"]:
+            lines.extend(
+                [
+                    f"- scenario `{result['scenario']}` passed=`{result['passed']}` "
+                    f"assistant_similarity=`{result['assistant_similarity']}` "
+                    f"tail_similarity=`{result['tail_similarity']}` "
+                    f"barge_in_count=`{result['barge_in_count']}` "
+                    f"speak_latency_ms=`{result['speak_latency_ms']}`",
+                    f"  session: `{result['session_dir']}`",
+                    f"  assistant_text: `{result['assistant_text']}`",
+                ]
+            )
+        lines.append("")
+
+    if stage_reports:
+        final_stage = stage_reports[-1]
+        lines.extend(
+            [
+                "## Final Status",
+                "",
+                f"- last_stage: `{final_stage['stage_name']}`",
+                f"- passed: `{final_stage['passed']}`",
+                f"- automatically_continue_to_next_stage: `{final_stage['passed']}`",
+                "",
+            ]
+        )
+
+    path = run_dir / "reports" / "live_plan_summary.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unattended local duplex self-test")
     parser.add_argument("--tune", action="store_true", help="Run the small parameter search instead of a single baseline test")
-    parser.add_argument(
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument(
         "--scenario",
         choices=(
             "audio_short",
@@ -1807,8 +1961,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "omni_chat_fixed_scene",
             "all",
         ),
-        default="all",
         help="Limit self-test to a specific scenario",
+    )
+    selector.add_argument(
+        "--plan",
+        choices=tuple(LIVE_PLANS),
+        help="Run a staged live plan; each stage must pass before the next stage starts",
     )
     return parser
 
@@ -1819,9 +1977,6 @@ def main() -> int:
 
     ensure_sounddevice_available()
     base_config = load_runtime_config(str(DEFAULT_CONFIG_PATH))
-    selected_scenarios = PROMPTS
-    if args.scenario != "all":
-        selected_scenarios = [item for item in PROMPTS if item.name == args.scenario]
     run_id = time.strftime("%Y%m%d-%H%M%S")
     run_dir = SELFTEST_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1831,21 +1986,38 @@ def main() -> int:
         run_dir=run_dir,
     )
 
-    best_overrides, best_results = _run_search(
-        run_dir=run_dir,
-        capture_device=base_config.audio.capture_device,
-        playback_device=base_config.audio.playback_device,
-        scenarios=selected_scenarios,
-        tune=args.tune,
-    )
+    live_plan_summary: Path | None = None
+    if args.plan:
+        plan = LIVE_PLANS[args.plan]
+        best_overrides, best_results, stage_reports = _run_live_plan(
+            run_dir=run_dir,
+            plan=plan,
+            capture_device=base_config.audio.capture_device,
+            playback_device=base_config.audio.playback_device,
+            tune=args.tune,
+        )
+        live_plan_summary = _render_live_plan_summary(
+            run_dir=run_dir,
+            plan=plan,
+            stage_reports=stage_reports,
+        )
+    else:
+        selected_scenarios = PROMPTS
+        if args.scenario and args.scenario != "all":
+            selected_scenarios = [item for item in PROMPTS if item.name == args.scenario]
+        best_overrides, best_results = _run_search(
+            run_dir=run_dir,
+            capture_device=base_config.audio.capture_device,
+            playback_device=base_config.audio.playback_device,
+            scenarios=selected_scenarios,
+            tune=args.tune,
+        )
 
-    final_summary = _render_final_summary(
-        run_dir=run_dir,
-        selected_overrides=best_overrides,
-        results=best_results,
-    )
+    final_summary = _render_final_summary(run_dir=run_dir, selected_overrides=best_overrides, results=best_results)
     print(f"Self-test run directory: {run_dir}")
     print(f"Final summary: {final_summary}")
+    if live_plan_summary is not None:
+        print(f"Live plan summary: {live_plan_summary}")
     print(f"Selected overrides: {json.dumps(best_overrides, ensure_ascii=False)}")
     return 0
 

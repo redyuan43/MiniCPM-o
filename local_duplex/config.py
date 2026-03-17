@@ -121,6 +121,7 @@ class RuntimeConfig:
     playback_immediate_start_min_ms: int
     assistant_continuation_grace_chunks: int
     idle_kv_cleanup_after_ms: int
+    strict_interrupt_ack: bool
     chunk_barge_in_rms_threshold: float
     chunk_barge_in_peak_threshold: float
     chunk_barge_in_consecutive_chunks: int
@@ -230,6 +231,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "playback_immediate_start_min_ms": 600,
         "assistant_continuation_grace_chunks": 12,
         "idle_kv_cleanup_after_ms": 15000,
+        "strict_interrupt_ack": False,
         "chunk_barge_in_rms_threshold": 0.024,
         "chunk_barge_in_peak_threshold": 0.14,
         "chunk_barge_in_consecutive_chunks": 1,

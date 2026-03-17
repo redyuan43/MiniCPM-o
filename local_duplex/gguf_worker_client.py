@@ -152,54 +152,25 @@ class GgufWorkerClient:
                 ),
             }
         )
+        result = self._result_from_worker_response(response)
         self._current_chunk_index += 1
-        audio_data = None
-        response_audio_paths = [str(path) for path in (response.get("audio_wav_paths") or []) if path]
-        audio_paths = list(response_audio_paths)
-        stop_reason = str(response.get("stop_reason", "empty") or "empty")
-        backend_end_of_turn = bool(response.get("backend_end_of_turn", response.get("end_of_turn", False)))
-        should_collect_audio = (
-            not bool(response.get("is_listen", True))
-            or bool(response.get("end_of_turn", False))
-            or bool(response.get("text"))
+        return result
+
+    def listen_tick(self, stop_reason: str) -> GgufDuplexGenerateResult:
+        response = self._request(
+            {
+                "type": "listen_tick",
+                "chunk_index": self._current_chunk_index,
+                "stop_reason": stop_reason,
+            }
         )
-        fallback_audio_paths = self._collect_missing_worker_audio_paths(
-            should_wait=should_collect_audio,
-            end_of_turn=backend_end_of_turn,
-        )
-        if fallback_audio_paths:
-            audio_paths = self._merge_audio_paths(audio_paths, fallback_audio_paths)
-        if audio_paths:
-            audio = self._load_worker_audio(audio_paths)
-            if audio.size:
-                audio_data = base64.b64encode(audio.astype(np.float32, copy=False).tobytes()).decode("utf-8")
-        clean_text = self._strip_think_blocks(response.get("text", "") or "")
-        return GgufDuplexGenerateResult(
-            is_listen=bool(response.get("is_listen", True)),
-            text=clean_text,
-            audio_data=audio_data,
-            end_of_turn=bool(response.get("end_of_turn", False)),
-            backend_end_of_turn=backend_end_of_turn,
-            ended_with_listen=bool(response.get("ended_with_listen", False)),
-            stop_reason=stop_reason,
-            current_time=int(response.get("chunk_index", self._current_chunk_index - 1)),
-            cost_all_ms=float(response["cost_all_ms"]) if response.get("cost_all_ms") is not None else None,
-            cost_llm_ms=float(response["decode_ms"]) if response.get("decode_ms") is not None else None,
-            cost_tts_prep_ms=float(response["wav_wait_ms"]) if response.get("wav_wait_ms") is not None else None,
-            cost_token2wav_ms=(
-                float(response["trailing_wait_ms"]) if response.get("trailing_wait_ms") is not None else None
-            ),
-            worker_decode_ms=float(response["decode_ms"]) if response.get("decode_ms") is not None else None,
-            worker_wav_wait_ms=(
-                float(response["wav_wait_ms"]) if response.get("wav_wait_ms") is not None else None
-            ),
-            worker_trailing_wait_ms=(
-                float(response["trailing_wait_ms"]) if response.get("trailing_wait_ms") is not None else None
-            ),
-            n_tokens=response.get("n_tokens"),
-            n_tts_tokens=response.get("n_tts_tokens"),
-            server_send_ts=time.time(),
-        )
+        result = self._result_from_worker_response(response)
+        self._current_chunk_index += 1
+        return result
+
+    def commit_played_output(self) -> bool:
+        response = self._request({"type": "commit_played"}, allow_failure=False)
+        return bool(response.get("boundary_committed", False))
 
     @property
     def worker_runtime_dir(self) -> Path:
@@ -277,6 +248,56 @@ class GgufWorkerClient:
         self._io_counter += 1
         sf.write(str(audio_path), audio_waveform, self.config.audio.input_sample_rate, subtype="PCM_16")
         return audio_path
+
+    def _result_from_worker_response(self, response: dict[str, Any]) -> GgufDuplexGenerateResult:
+        audio_data = None
+        response_audio_paths = [str(path) for path in (response.get("audio_wav_paths") or []) if path]
+        audio_paths = list(response_audio_paths)
+        stop_reason = str(response.get("stop_reason", "empty") or "empty")
+        backend_end_of_turn = bool(response.get("backend_end_of_turn", response.get("end_of_turn", False)))
+        should_collect_audio = (
+            not bool(response.get("is_listen", True))
+            or bool(response.get("end_of_turn", False))
+            or bool(response.get("text"))
+            or bool(audio_paths)
+        )
+        fallback_audio_paths = self._collect_missing_worker_audio_paths(
+            should_wait=should_collect_audio,
+            end_of_turn=backend_end_of_turn,
+        )
+        if fallback_audio_paths:
+            audio_paths = self._merge_audio_paths(audio_paths, fallback_audio_paths)
+        if audio_paths:
+            audio = self._load_worker_audio(audio_paths)
+            if audio.size:
+                audio_data = base64.b64encode(audio.astype(np.float32, copy=False).tobytes()).decode("utf-8")
+        clean_text = self._strip_think_blocks(response.get("text", "") or "")
+        return GgufDuplexGenerateResult(
+            is_listen=bool(response.get("is_listen", True)),
+            text=clean_text,
+            audio_data=audio_data,
+            end_of_turn=bool(response.get("end_of_turn", False)),
+            backend_end_of_turn=backend_end_of_turn,
+            ended_with_listen=bool(response.get("ended_with_listen", False)),
+            stop_reason=stop_reason,
+            current_time=int(response.get("chunk_index", self._current_chunk_index)),
+            cost_all_ms=float(response["cost_all_ms"]) if response.get("cost_all_ms") is not None else None,
+            cost_llm_ms=float(response["decode_ms"]) if response.get("decode_ms") is not None else None,
+            cost_tts_prep_ms=float(response["wav_wait_ms"]) if response.get("wav_wait_ms") is not None else None,
+            cost_token2wav_ms=(
+                float(response["trailing_wait_ms"]) if response.get("trailing_wait_ms") is not None else None
+            ),
+            worker_decode_ms=float(response["decode_ms"]) if response.get("decode_ms") is not None else None,
+            worker_wav_wait_ms=(
+                float(response["wav_wait_ms"]) if response.get("wav_wait_ms") is not None else None
+            ),
+            worker_trailing_wait_ms=(
+                float(response["trailing_wait_ms"]) if response.get("trailing_wait_ms") is not None else None
+            ),
+            n_tokens=response.get("n_tokens"),
+            n_tts_tokens=response.get("n_tts_tokens"),
+            server_send_ts=time.time(),
+        )
 
     def _write_frame_input(self, frame: Image.Image) -> Path:
         frame_path = self._input_dir / f"frame_{self._io_counter:08d}.jpg"

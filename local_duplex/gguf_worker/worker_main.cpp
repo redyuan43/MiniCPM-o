@@ -577,6 +577,57 @@ json handle_generate(WorkerState & state, const json & req) {
     };
 }
 
+json handle_listen_tick(WorkerState & state, const json & req) {
+    if (!state.prepared || state.ctx == nullptr) {
+        throw std::runtime_error("worker is not prepared");
+    }
+    const std::string stop_reason = req.value("stop_reason", "listen_tick");
+    const bool followup_tail_scan = state.pending_tail_scan_chunks > 0;
+    const auto wav_result = followup_tail_scan
+        ? collect_generate_wavs(state, true, false, DoneFlagSnapshot{})
+        : WavCollectResult{};
+    if (followup_tail_scan) {
+        if (!wav_result.paths.empty()) {
+            state.pending_tail_scan_chunks = 0;
+        } else if (state.pending_tail_scan_chunks > 0) {
+            state.pending_tail_scan_chunks -= 1;
+        }
+    }
+    const int used_chunk_index = state.chunk_index;
+    state.chunk_index += 1;
+    const int cost_all_ms = wav_result.wav_wait_ms + wav_result.trailing_wait_ms;
+    return {
+        {"ok", true},
+        {"chunk_index", used_chunk_index},
+        {"is_listen", true},
+        {"end_of_turn", false},
+        {"backend_end_of_turn", false},
+        {"ended_with_listen", true},
+        {"stop_reason", stop_reason},
+        {"text", ""},
+        {"audio_wav_paths", wav_result.paths},
+        {"decode_ms", 0},
+        {"final_speek_wait_ms", 0},
+        {"wav_wait_ms", wav_result.wav_wait_ms},
+        {"trailing_wait_ms", wav_result.trailing_wait_ms},
+        {"cost_all_ms", cost_all_ms},
+        {"n_tokens", 0},
+        {"n_tts_tokens", 0},
+    };
+}
+
+json handle_commit_played(WorkerState & state) {
+    if (!state.prepared || state.ctx == nullptr) {
+        throw std::runtime_error("worker is not prepared");
+    }
+    const bool boundary_committed = duplex_commit_assistant_turn_boundary(state.ctx);
+    return {
+        {"ok", true},
+        {"boundary_committed", boundary_committed},
+        {"n_past", state.ctx->n_past},
+    };
+}
+
 json handle_break(WorkerState & state) {
     if (!state.initialized || state.ctx == nullptr) {
         throw std::runtime_error("worker is not initialized");
@@ -633,6 +684,10 @@ int main() {
                 response = handle_prefill(state, req);
             } else if (type == "generate") {
                 response = handle_generate(state, req);
+            } else if (type == "listen_tick") {
+                response = handle_listen_tick(state, req);
+            } else if (type == "commit_played") {
+                response = handle_commit_played(state);
             } else if (type == "break") {
                 response = handle_break(state);
             } else if (type == "shutdown") {
