@@ -259,6 +259,7 @@ class SoundDeviceCapture:
         self._playback_active = False
         self._playback_active_ms = 0.0
         self._playback_remaining_ms = 0.0
+        self._playback_state_updated_monotonic = 0.0
         self._lock = threading.Condition()
         self._stop = threading.Event()
         self._reader_error: str | None = None
@@ -295,11 +296,16 @@ class SoundDeviceCapture:
 
     def set_playback_state(self, active: bool, active_ms: float, remaining_ms: float) -> None:
         with self._lock:
+            was_active = self._playback_active
+            previous_active_ms = self._playback_active_ms
             self._playback_active = active
             self._playback_active_ms = active_ms
             self._playback_remaining_ms = remaining_ms
-            if not active:
+            self._playback_state_updated_monotonic = time.monotonic()
+            new_playback_segment = active and was_active and active_ms + 1e-3 < previous_active_ms
+            if not active or not was_active or new_playback_segment:
                 self._hold_samples = 0
+                self._interrupt_requested = False
 
     def poll_interrupt(self) -> bool:
         with self._lock:
@@ -365,10 +371,24 @@ class SoundDeviceCapture:
         with self._lock:
             self._buffers.append(mono)
             self._buffered_samples += mono.size
+            now = time.monotonic()
+            elapsed_ms = max(
+                0.0,
+                (now - self._playback_state_updated_monotonic) * 1000.0,
+            )
+            effective_playback_active_ms = (
+                self._playback_active_ms + elapsed_ms
+                if self._playback_active
+                else 0.0
+            )
+            effective_playback_remaining_ms = max(
+                0.0,
+                self._playback_remaining_ms - elapsed_ms,
+            )
             playback_interruptible = (
                 self._playback_active
-                and self._playback_active_ms >= self.config.interrupt_min_playback_ms
-                and self._playback_remaining_ms > self.config.interrupt_tail_protect_ms
+                and effective_playback_active_ms >= self.config.interrupt_min_playback_ms
+                and effective_playback_remaining_ms > self.config.interrupt_tail_protect_ms
             )
             if (
                 playback_interruptible

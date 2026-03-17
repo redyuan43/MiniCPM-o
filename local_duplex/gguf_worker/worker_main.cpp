@@ -582,10 +582,21 @@ json handle_break(WorkerState & state) {
         throw std::runtime_error("worker is not initialized");
     }
     state.ctx->break_event.store(true);
+    state.ctx->current_turn_ended = true;
+    state.ctx->ended_with_listen.store(true);
+    {
+        std::lock_guard<std::mutex> text_lock(state.ctx->text_mtx);
+        state.ctx->text_queue.clear();
+        state.ctx->text_done_flag = true;
+    }
+    state.ctx->text_cv.notify_all();
     stop_speek(state.ctx);
+    const bool rollback_applied = duplex_rollback_assistant_turn(state.ctx);
     return {
         {"ok", true},
-        {"message", "break_set"},
+        {"message", rollback_applied ? "break_set_rollback" : "break_set"},
+        {"rollback_applied", rollback_applied},
+        {"n_past", state.ctx->n_past},
     };
 }
 

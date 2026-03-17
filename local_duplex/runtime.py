@@ -31,6 +31,7 @@ from local_duplex.video import VideoWorker
 
 LOGGER = logging.getLogger("local_duplex")
 POST_BARGE_IN_RELEASE_SILENT_CHUNKS = 1
+RECENT_USER_SIGNAL_GRACE_MS = 6000
 
 
 class _RuntimeSignalHandler(logging.Handler):
@@ -86,6 +87,7 @@ class LocalDuplexRunner:
         self._assistant_playback_started = False
         self._assistant_continuation_grace_remaining = 0
         self._last_interaction_monotonic = time.monotonic()
+        self._last_user_signal_monotonic = 0.0
         self._chunk_barge_in_streak = 0
         self._signal_handler: _RuntimeSignalHandler | None = None
         self._observed_loggers: list[logging.Logger] = []
@@ -99,6 +101,8 @@ class LocalDuplexRunner:
         self._pending_interrupt_user_segment_seen = False
         self._current_assistant_turn_role = "normal_reply"
         self._current_assistant_interrupt_group_id: int | None = None
+        self._recent_assistant_fragments: list[str] = []
+        self._interrupted_assistant_reference_text = ""
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
@@ -136,7 +140,21 @@ class LocalDuplexRunner:
                 audio_rms = float(math.sqrt(np.mean(audio_chunk * audio_chunk))) if audio_chunk.size else 0.0
                 audio_peak = float(np.max(np.abs(audio_chunk))) if audio_chunk.size else 0.0
                 speech_detected = audio_rms >= self.config.runtime.speech_detect_rms
-                barge_in_detected = playback_active and self.capture.poll_interrupt()
+                raw_capture_barge_in = playback_active and self.capture.poll_interrupt()
+                capture_barge_in_confirmed = raw_capture_barge_in and (
+                    speech_detected
+                    or self._user_turn_active
+                    or audio_rms >= self.config.audio.interrupt_rms_threshold * 0.5
+                    or audio_peak >= self.config.audio.interrupt_peak_threshold * 0.5
+                )
+                if raw_capture_barge_in and not capture_barge_in_confirmed:
+                    LOGGER.info(
+                        "Ignoring capture barge-in without chunk speech evidence rms=%.4f peak=%.4f chunk=%s",
+                        audio_rms,
+                        audio_peak,
+                        chunk_index,
+                    )
+                barge_in_detected = capture_barge_in_confirmed
                 chunk_barge_in_detected = self._update_chunk_barge_in(
                     playback_active=playback_active,
                     playback_active_ms=playback_active_ms,
@@ -177,6 +195,8 @@ class LocalDuplexRunner:
                     speech_activation_window_open=speech_activation_window_open,
                     playback_active=playback_active,
                 )
+                if speech_detected or speech_activation_window_open or self._user_turn_active:
+                    self._last_user_signal_monotonic = time.monotonic()
                 self._after_user_turn_state_update(
                     previous_user_turn_active=previous_user_turn_active,
                     playback_active=playback_active,
@@ -187,6 +207,7 @@ class LocalDuplexRunner:
                     self._barge_in_listen_lock = True
                     self._barge_in_release_silent_chunks_remaining = POST_BARGE_IN_RELEASE_SILENT_CHUNKS
                     barge_in_listen_lock_active = True
+                    self._interrupted_assistant_reference_text = "".join(self._recent_assistant_fragments[-12:])
                     self._close_assistant_turn()
                     self.playback.clear()
                     self._assistant_playback_started = False
@@ -287,6 +308,24 @@ class LocalDuplexRunner:
                     )
                     backend_end_of_turn = False
                     stop_reason = "barge_in_suppressed"
+                elif self._should_suppress_stale_interrupt_reply(result):
+                    LOGGER.info("Suppressing stale assistant residual after interrupt at chunk=%s", chunk_index)
+                    self._barge_in_listen_lock = True
+                    self._barge_in_release_silent_chunks_remaining = max(
+                        self._barge_in_release_silent_chunks_remaining,
+                        POST_BARGE_IN_RELEASE_SILENT_CHUNKS + 1,
+                    )
+                    result.is_listen = True
+                    result.text = ""
+                    result.audio_data = None
+                    self._set_result_stop_metadata(
+                        result,
+                        stop_reason="interrupt_residual_suppressed",
+                        backend_end_of_turn=False,
+                        ended_with_listen=True,
+                    )
+                    backend_end_of_turn = False
+                    stop_reason = "interrupt_residual_suppressed"
                 assistant_turn_role, interrupt_group_id = self._current_assistant_turn_metadata(result)
 
                 if result.is_listen:
@@ -310,6 +349,10 @@ class LocalDuplexRunner:
                             decode_model_audio(result.audio_data),
                             end_of_turn=backend_end_of_turn,
                         )
+                    if result.text:
+                        self._recent_assistant_fragments.append(str(result.text))
+                        if len(self._recent_assistant_fragments) > 12:
+                            self._recent_assistant_fragments = self._recent_assistant_fragments[-12:]
                 if speech_detected or playback_active:
                     self._last_interaction_monotonic = time.monotonic()
                 self._update_assistant_turn_state(result)
@@ -560,6 +603,7 @@ class LocalDuplexRunner:
         self._assistant_playback_started = False
         self._assistant_continuation_grace_remaining = 0
         self._last_interaction_monotonic = time.monotonic()
+        self._last_user_signal_monotonic = 0.0
         self._chunk_barge_in_streak = 0
         self._playback_echo_suppressed_chunks = 0
         self._barge_in_latched = False
@@ -571,6 +615,8 @@ class LocalDuplexRunner:
         self._pending_interrupt_user_segment_seen = False
         self._current_assistant_turn_role = "normal_reply"
         self._current_assistant_interrupt_group_id = None
+        self._recent_assistant_fragments = []
+        self._interrupted_assistant_reference_text = ""
         self._vision_question_frame_pending = False
         self._user_turn_active = False
         self._last_vision_frame_sent_monotonic = 0.0
@@ -656,12 +702,18 @@ class LocalDuplexRunner:
             speech_detected
             or speech_activation_window_open
             or self._speech_recent_chunks_remaining > 0
+            or (
+                self._last_user_signal_monotonic > 0.0
+                and (time.monotonic() - self._last_user_signal_monotonic) * 1000.0 <= RECENT_USER_SIGNAL_GRACE_MS
+            )
         )
         if (
             has_recent_user_input
             or playback_active
             or self._assistant_turn_open
             or self._assistant_continuation_grace_remaining > 0
+            or self._active_interrupt_group_id is not None
+            or self._pending_interrupt_ack
         ):
             self._unsolicited_speak_suppressed_count = 0
             return result, False
@@ -859,6 +911,39 @@ class LocalDuplexRunner:
         )
         return any(keyword in normalized for keyword in ack_keywords)
 
+    @staticmethod
+    def _normalize_interrupt_text(text: str) -> str:
+        normalized = str(text or "").strip().lower()
+        for token in (" ", "\n", "\t", "。", "，", ",", ".", "！", "？", ":", "：", ";", "；"):
+            normalized = normalized.replace(token, "")
+        return normalized
+
+    def _looks_like_stale_interrupted_reply(self, text: str) -> bool:
+        reference = self._normalize_interrupt_text(self._interrupted_assistant_reference_text)
+        candidate = self._normalize_interrupt_text(text)
+        if not reference or len(candidate) < 2:
+            return False
+        if candidate in reference or reference in candidate:
+            return True
+        overlap_hits = 0
+        total = 0
+        for index in range(max(0, len(candidate) - 1)):
+            fragment = candidate[index : index + 2]
+            if len(fragment) < 2:
+                continue
+            total += 1
+            if fragment in reference:
+                overlap_hits += 1
+        return total > 0 and (overlap_hits / total) >= 0.6
+
+    def _should_suppress_stale_interrupt_reply(self, result) -> bool:
+        if result.is_listen or not self._pending_interrupt_ack:
+            return False
+        text = str(result.text or "").strip()
+        if not text or self._looks_like_interrupt_ack(text):
+            return False
+        return self._looks_like_stale_interrupted_reply(text)
+
     def _classify_barge_in(self) -> tuple[str, int]:
         if self._active_interrupt_group_id is not None and (
             self._pending_interrupt_ack or self._current_assistant_turn_role == "interrupt_ack"
@@ -877,6 +962,7 @@ class LocalDuplexRunner:
         self._pending_interrupt_user_segment_seen = False
         self._current_assistant_turn_role = "normal_reply"
         self._current_assistant_interrupt_group_id = None
+        self._interrupted_assistant_reference_text = ""
 
     def _maybe_close_interrupt_episode(self, *, playback_active: bool) -> None:
         if (
@@ -906,11 +992,9 @@ class LocalDuplexRunner:
         ):
             if self._pending_interrupt_user_segment_seen:
                 LOGGER.info(
-                    "Closing pending interrupt episode without ack before new user turn at chunk=%s",
+                    "Keeping pending interrupt episode across additional user segment at chunk=%s",
                     self._active_chunk_index,
                 )
-                self._close_interrupt_episode()
-                return
             self._pending_interrupt_user_segment_seen = True
         self._maybe_close_interrupt_episode(playback_active=playback_active)
 

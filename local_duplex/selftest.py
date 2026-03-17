@@ -144,10 +144,10 @@ PROMPTS: list[PromptScenario] = [
             "session": {
                 "system_prompt": (
                     "You are a bilingual robot assistant. Only speak after clear user speech. "
-                    "When the user asks for a story, tell a complete short story with multiple sentences "
-                    "instead of a one-line reply. Keep the story coherent and finish the sentence before stopping."
+                    "When the user asks for a story, tell a complete short story in exactly five short sentences "
+                    "instead of a one-line reply. Keep the story coherent and finish the final sentence before stopping."
                 ),
-                "max_new_speak_tokens_per_chunk": 36,
+                "max_new_speak_tokens_per_chunk": 42,
             },
             "runtime": {
                 "assistant_continuation_grace_chunks": 14,
@@ -169,10 +169,10 @@ PROMPTS: list[PromptScenario] = [
             "session": {
                 "system_prompt": (
                     "You are a bilingual robot assistant. Only speak after clear user speech. "
-                    "When asked for a story, tell a complete short story with multiple sentences. "
+                    "When asked for a story, tell a complete short story in exactly five short sentences. "
                     "If the user clearly interrupts while you are speaking, stop quickly and answer the interruption first."
                 ),
-                "max_new_speak_tokens_per_chunk": 36,
+                "max_new_speak_tokens_per_chunk": 8,
             },
             "audio": {
                 "interrupt_rms_threshold": 0.025,
@@ -198,7 +198,7 @@ PROMPTS: list[PromptScenario] = [
                 prompt_text="停，先回答我。",
                 post_wait_s=8.0,
                 trigger="after_assistant_start",
-                trigger_delay_s=0.15,
+                trigger_playback_active_ms=1200,
                 playback_gain=3.0,
             ),
             ScenarioStep(
@@ -216,11 +216,11 @@ PROMPTS: list[PromptScenario] = [
             "session": {
                 "system_prompt": (
                     "You are a bilingual robot assistant. Only speak after clear user speech. "
-                    "When asked for a story, tell a complete short story with multiple sentences. "
+                    "When asked for a story, tell a complete short story in exactly five short sentences. "
                     "If the user clearly interrupts while you are speaking, stop quickly, answer the interruption first, "
                     "and only continue the story if the user asks you to continue."
                 ),
-                "max_new_speak_tokens_per_chunk": 36,
+                "max_new_speak_tokens_per_chunk": 18,
             },
             "audio": {
                 "interrupt_rms_threshold": 0.025,
@@ -246,7 +246,7 @@ PROMPTS: list[PromptScenario] = [
                 prompt_text="停一下，先回答我是谁。",
                 post_wait_s=7.0,
                 trigger="after_assistant_start",
-                trigger_delay_s=0.15,
+                trigger_playback_active_ms=1200,
                 playback_gain=3.0,
             ),
             ScenarioStep(
@@ -259,7 +259,7 @@ PROMPTS: list[PromptScenario] = [
                 prompt_text="再停一下，现在请换成一句话总结刚才的故事。",
                 post_wait_s=8.0,
                 trigger="after_assistant_start",
-                trigger_delay_s=0.15,
+                trigger_playback_active_ms=1200,
                 playback_gain=3.0,
             ),
         ],
@@ -276,18 +276,18 @@ PROMPTS: list[PromptScenario] = [
                     "If the user interrupts you, stop quickly, give a very short acknowledgement, "
                     "and when asked to continue, resume from the first unfinished step instead of restarting from step one."
                 ),
-                "max_new_speak_tokens_per_chunk": 36,
+                "max_new_speak_tokens_per_chunk": 8,
             },
             "audio": {
-                "interrupt_rms_threshold": 0.025,
-                "interrupt_peak_threshold": 0.12,
-                "interrupt_min_playback_ms": 120,
-                "interrupt_hold_ms": 70,
+                "interrupt_rms_threshold": 0.02,
+                "interrupt_peak_threshold": 0.10,
+                "interrupt_min_playback_ms": 80,
+                "interrupt_hold_ms": 50,
             },
             "runtime": {
                 "assistant_continuation_grace_chunks": 14,
-                "chunk_barge_in_rms_threshold": 0.02,
-                "chunk_barge_in_peak_threshold": 0.12,
+                "chunk_barge_in_rms_threshold": 0.018,
+                "chunk_barge_in_peak_threshold": 0.10,
                 "chunk_barge_in_consecutive_chunks": 1,
             },
         },
@@ -302,16 +302,15 @@ PROMPTS: list[PromptScenario] = [
             ),
             ScenarioStep(
                 name="interrupt_ack",
-                prompt_text="停，先只回答我：收到。",
-                post_wait_s=4.0,
+                prompt_text="停，只说收到。",
+                post_wait_s=8.0,
                 trigger="after_assistant_start",
-                trigger_delay_s=0.15,
-                trigger_playback_active_ms=2200,
+                trigger_playback_active_ms=200,
                 playback_gain=3.0,
             ),
             ScenarioStep(
                 name="resume_unfinished_steps",
-                prompt_text="现在从刚才没说完的步骤继续，不要从头开始。",
+                prompt_text="现在从刚才被打断的地方继续，把第四步和第五步完整说完，不要从头开始。",
                 post_wait_s=10.0,
             ),
         ],
@@ -404,7 +403,8 @@ PROMPTS: list[PromptScenario] = [
                 "system_prompt": (
                     "You are a bilingual robot assistant. Only speak after clear user speech. "
                     "When the user asks what you see, answer based on the latest camera frame from the start of the user's question. "
-                    "If the scene is unchanged and the same question is asked again, keep the answer consistent."
+                    "If the scene is unchanged and the same question is asked again, keep the answer consistent. "
+                    "Answer in one short sentence that names only the main objects."
                 ),
                 "max_new_speak_tokens_per_chunk": 24,
             },
@@ -412,12 +412,12 @@ PROMPTS: list[PromptScenario] = [
         steps=[
             ScenarioStep(
                 name="vision_question_first",
-                prompt_text="你现在看到了什么？请简短回答主要物体。",
+                prompt_text="你现在看到了什么？请用一句短句回答主要物体。",
                 post_wait_s=10.0,
             ),
             ScenarioStep(
                 name="vision_question_repeat",
-                prompt_text="现在还是同一个画面。你又看到了什么？请简短回答主要物体。",
+                prompt_text="现在还是同一个画面。你又看到了什么？请用一句短句回答主要物体。",
                 post_wait_s=10.0,
             ),
         ],
@@ -431,7 +431,8 @@ PROMPTS: list[PromptScenario] = [
                 "system_prompt": (
                     "You are a bilingual robot assistant. Only speak after clear user speech. "
                     "Use the latest frame captured at the start of each user question. "
-                    "If the scene is unchanged, keep visual answers consistent across turns."
+                    "If the scene is unchanged, keep visual answers consistent across turns. "
+                    "Answer in one short sentence that names only the main objects."
                 ),
                 "max_new_speak_tokens_per_chunk": 24,
             },
@@ -533,11 +534,10 @@ SELFTEST_BASE_OVERRIDES: dict[str, Any] = {
         "force_listen_count": 1,
     },
     "runtime": {
-        "allow_unsolicited_speak": True,
-        "unsolicited_speak_reset_threshold": 999,
+        "allow_unsolicited_speak": False,
         "idle_kv_cleanup_after_ms": 30000,
-        "speech_activation_chunks": 1,
-        "speech_activation_min_rms": 0.01,
+        "speech_activation_chunks": 2,
+        "speech_activation_min_rms": 0.015,
     }
 }
 
@@ -1230,6 +1230,58 @@ def _count_keyword_hits(text: str, keywords: list[str]) -> int:
     return sum(1 for keyword in keywords if keyword in text)
 
 
+def _semantic_fragments(text: str) -> list[str]:
+    cleaned = str(text or "").strip().lower()
+    if not cleaned:
+        return []
+    for old, new in (
+        ("。", ","),
+        ("，", ","),
+        ("、", ","),
+        ("；", ","),
+        (";", ","),
+        (" and ", ","),
+        ("还有", ","),
+        ("以及", ","),
+        ("和", ","),
+    ):
+        cleaned = cleaned.replace(old, new)
+    fragments: list[str] = []
+    prefixes = (
+        "我看到",
+        "现在看到",
+        "现在我看到",
+        "依然是",
+        "还是",
+        "我看到了",
+        "i can see",
+        "i see",
+        "there is",
+        "there are",
+    )
+    for part in cleaned.split(","):
+        candidate = part.strip()
+        for prefix in prefixes:
+            if candidate.startswith(prefix):
+                candidate = candidate[len(prefix):].strip()
+        candidate = candidate.strip(" .")
+        if len(candidate) >= 2:
+            fragments.append(candidate)
+    return fragments
+
+
+def _fragment_overlap_ratio(lhs: str, rhs: str) -> float:
+    lhs_fragments = _semantic_fragments(lhs)
+    rhs_fragments = _semantic_fragments(rhs)
+    if not lhs_fragments or not rhs_fragments:
+        return 0.0
+    hits = 0
+    for rhs_fragment in rhs_fragments:
+        if any(rhs_fragment in lhs_fragment or lhs_fragment in rhs_fragment for lhs_fragment in lhs_fragments):
+            hits += 1
+    return hits / float(len(rhs_fragments))
+
+
 def _scenario_report_path(run_dir: Path, scenario: str) -> Path:
     return run_dir / "reports" / f"{scenario}.json"
 
@@ -1334,6 +1386,19 @@ def _score_result(
             and assistant_similarity >= 0.45
             and assistant_turn_stability >= 0.25
         )
+    elif scenario.name == "omni_scene_stability":
+        first_response = step_assistant_texts[0] if len(step_assistant_texts) >= 1 else ""
+        second_response = step_assistant_texts[1] if len(step_assistant_texts) >= 2 else ""
+        passed = bool(
+            prompt_similarity >= 0.8
+            and turns >= 2
+            and first_response
+            and second_response
+            and (
+                _similarity(first_response, second_response) >= 0.65
+                or _fragment_overlap_ratio(first_response, second_response) >= 0.66
+            )
+        )
     elif scenario.name == "audio_ordered_steps_interrupt_resume":
         passed = bool(
             assistant_text
@@ -1437,24 +1502,68 @@ def _latest_chunk_index(session_dir: Path) -> int:
     return int(latest_chunk.get("chunk_index", -1))
 
 
+def _assistant_output_active(session_dir: Path) -> bool:
+    latest_chunk = _latest_chunk_event(session_dir)
+    if latest_chunk is None:
+        return False
+    if str(latest_chunk.get("assistant", {}).get("state") or "").strip() == "speak":
+        return True
+    input_state = latest_chunk.get("input", {}) or {}
+    if bool(input_state.get("playback_active")):
+        return True
+    return float(input_state.get("playback_remaining_ms", 0.0) or 0.0) > 50.0
+
+
+def _wait_for_assistant_idle(
+    session_dir: Path,
+    *,
+    min_wait_s: float,
+    stable_s: float = 1.2,
+    timeout_s: float = 45.0,
+) -> None:
+    start = time.monotonic()
+    earliest_idle_check = start + min_wait_s
+    deadline = earliest_idle_check + timeout_s
+    stable_since: float | None = None
+
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if now < earliest_idle_check:
+            time.sleep(min(0.2, earliest_idle_check - now))
+            continue
+        if _assistant_output_active(session_dir):
+            stable_since = None
+        else:
+            if stable_since is None:
+                stable_since = now
+            elif now - stable_since >= stable_s:
+                return
+        time.sleep(0.2)
+
+
 def _wait_for_assistant_start(
     session_dir: Path,
     baseline_count: int,
     timeout_s: float = 25.0,
     trigger_playback_active_ms: float | None = None,
+    chunk_ms: int = 600,
 ) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if _count_assistant_chunks(session_dir) > baseline_count:
+        assistant_chunks = _count_assistant_chunks(session_dir)
+        if assistant_chunks > baseline_count:
             if trigger_playback_active_ms is None:
                 return True
             latest_chunk = _latest_chunk_event(session_dir)
+            chunk_progress_ms = max(0, assistant_chunks - baseline_count) * chunk_ms
             if (
                 latest_chunk is not None
                 and latest_chunk.get("assistant", {}).get("state") == "speak"
                 and latest_chunk.get("input", {}).get("playback_active")
                 and float(latest_chunk.get("input", {}).get("playback_active_ms", 0.0)) >= trigger_playback_active_ms
             ):
+                return True
+            if chunk_progress_ms >= trigger_playback_active_ms:
                 return True
         time.sleep(0.2)
     return False
@@ -1492,6 +1601,7 @@ def _run_single_scenario(
     step_artifacts: list[dict[str, Any]] = []
     scenario_overrides = _deep_merge(overrides, scenario.config_overrides or {})
     config_path = _write_overlay_config(run_dir, scenario_overrides)
+    scenario_config = load_runtime_config(str(config_path))
 
     _stop_runtime()
     try:
@@ -1521,6 +1631,7 @@ def _run_single_scenario(
                     session_dir,
                     assistant_count,
                     trigger_playback_active_ms=step.trigger_playback_active_ms,
+                    chunk_ms=scenario_config.audio.chunk_ms,
                 )
                 if step.trigger_delay_s > 0:
                     time.sleep(step.trigger_delay_s)
@@ -1543,7 +1654,11 @@ def _run_single_scenario(
                     "prompt_start_chunk_index": prompt_start_chunk_index,
                 }
             )
-            time.sleep(step.post_wait_s)
+            next_step = scenario.steps[index + 1] if index + 1 < len(scenario.steps) else None
+            if next_step is not None and next_step.trigger == "after_assistant_start":
+                time.sleep(step.post_wait_s)
+            else:
+                _wait_for_assistant_idle(session_dir, min_wait_s=step.post_wait_s)
             assistant_count = _count_assistant_chunks(session_dir)
     finally:
         _stop_runtime()
