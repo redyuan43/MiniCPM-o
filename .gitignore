@@ -3,8 +3,10 @@ __pycache__
 .DS_Store
 .venv/
 .local_duplex/
+.minicpmo45_live_selftest/
 third_party/models/
 .serena/
 dist/
 build/
 third_party/llama.cpp-omni/
+third_party/minicpm-o-4_5-pytorch-simple-demo/
