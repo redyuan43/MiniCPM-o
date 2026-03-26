@@ -6,12 +6,158 @@ DEMO_DIR="${ROOT_DIR}/third_party/minicpm-o-4_5-pytorch-simple-demo"
 HF_HOME_DIR="${ROOT_DIR}/third_party/models/huggingface"
 CONFIG_PATH="${DEMO_DIR}/config.json"
 VENV_PYTHON="${DEMO_DIR}/.venv/base/bin/python"
-CERT_DIR="${DEMO_DIR}/certs"
-CERT_FILE="${CERT_DIR}/cert.pem"
-KEY_FILE="${CERT_DIR}/key.pem"
+DEFAULT_CERT_FILE="${DEMO_DIR}/certs/cert.pem"
+DEFAULT_KEY_FILE="${DEMO_DIR}/certs/key.pem"
+GENERATE_CERT_SCRIPT="${ROOT_DIR}/scripts/generate_minicpmo45_lan_cert.sh"
 PROTO_MARKER="${DEMO_DIR}/tmp/gateway.proto"
 WORKER_READY_TIMEOUT_S="${WORKER_READY_TIMEOUT_S:-240}"
 GATEWAY_READY_TIMEOUT_S="${GATEWAY_READY_TIMEOUT_S:-60}"
+
+GATEWAY_HOST="${MINICPMO_GATEWAY_HOST:-0.0.0.0}"
+PUBLIC_HOST="${MINICPMO_PUBLIC_HOST:-localhost}"
+TLS_EXTRA_DNS="${MINICPMO_TLS_EXTRA_DNS:-}"
+TLS_EXTRA_IPS="${MINICPMO_TLS_EXTRA_IPS:-}"
+CERT_FILE="${MINICPMO_SSL_CERTFILE:-${DEFAULT_CERT_FILE}}"
+KEY_FILE="${MINICPMO_SSL_KEYFILE:-${DEFAULT_KEY_FILE}}"
+REGENERATE_CERT=0
+use_http=0
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/start_minicpmo45_pytorch_demo_spark.sh [options]
+
+Start the official MiniCPM-o 4.5 PyTorch realtime demo for local or LAN access.
+
+Options:
+  --http                  Run without HTTPS/TLS
+  --gateway-host HOST     Bind host for the Gateway process. Default: 0.0.0.0
+  --public-host HOST      Hostname or IP remote browsers should open. Default: localhost
+  --tls-extra-dns LIST    Comma-separated extra DNS SAN entries for auto-generated cert
+  --tls-extra-ip LIST     Comma-separated extra IP SAN entries for auto-generated cert
+  --ssl-certfile PATH     TLS cert path. Relative paths resolve from repo root
+  --ssl-keyfile PATH      TLS key path. Relative paths resolve from repo root
+  --regen-cert            Regenerate the managed self-signed cert before startup
+  -h, --help              Show this help
+
+Environment overrides:
+  MINICPMO_GATEWAY_HOST
+  MINICPMO_PUBLIC_HOST
+  MINICPMO_TLS_EXTRA_DNS
+  MINICPMO_TLS_EXTRA_IPS
+  MINICPMO_SSL_CERTFILE
+  MINICPMO_SSL_KEYFILE
+  WORKER_READY_TIMEOUT_S
+  GATEWAY_READY_TIMEOUT_S
+EOF
+}
+
+resolve_path() {
+  local value="$1"
+  if [[ "${value}" = /* ]]; then
+    printf '%s\n' "${value}"
+  else
+    printf '%s\n' "${ROOT_DIR}/${value}"
+  fi
+}
+
+is_ip_literal() {
+  local value="$1"
+  [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "${value}" == *:* ]]
+}
+
+cert_covers_host() {
+  local cert_path="$1"
+  local host="$2"
+  local san_output
+
+  if ! command -v openssl >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ ! -f "${cert_path}" ]]; then
+    return 1
+  fi
+
+  san_output="$(openssl x509 -in "${cert_path}" -noout -ext subjectAltName 2>/dev/null || true)"
+  if [[ -z "${san_output}" ]]; then
+    return 1
+  fi
+
+  if is_ip_literal "${host}"; then
+    grep -Fq "IP Address:${host}" <<< "${san_output}"
+  else
+    grep -Eq "DNS:${host}([[:space:],]|$)" <<< "${san_output}"
+  fi
+}
+
+generate_gateway_cert() {
+  local reason="$1"
+  echo "==> Generating TLS cert for MiniCPM-o gateway (${reason})"
+  bash "${GENERATE_CERT_SCRIPT}" \
+    --public-host "${PUBLIC_HOST}" \
+    --tls-extra-dns "${TLS_EXTRA_DNS}" \
+    --tls-extra-ip "${TLS_EXTRA_IPS}" \
+    --certfile "${CERT_FILE}" \
+    --keyfile "${KEY_FILE}" \
+    --force
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --http)
+      use_http=1
+      shift
+      ;;
+    --gateway-host)
+      GATEWAY_HOST="$2"
+      shift 2
+      ;;
+    --public-host)
+      PUBLIC_HOST="$2"
+      shift 2
+      ;;
+    --tls-extra-dns)
+      TLS_EXTRA_DNS="$2"
+      shift 2
+      ;;
+    --tls-extra-ip|--tls-extra-ips)
+      TLS_EXTRA_IPS="$2"
+      shift 2
+      ;;
+    --ssl-certfile)
+      CERT_FILE="$2"
+      shift 2
+      ;;
+    --ssl-keyfile)
+      KEY_FILE="$2"
+      shift 2
+      ;;
+    --regen-cert)
+      REGENERATE_CERT=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unsupported argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "${PUBLIC_HOST}" ]]; then
+  echo "--public-host must not be empty" >&2
+  exit 1
+fi
+
+CERT_FILE="$(resolve_path "${CERT_FILE}")"
+KEY_FILE="$(resolve_path "${KEY_FILE}")"
+MANAGED_CERT=0
+if [[ "${CERT_FILE}" == "${DEFAULT_CERT_FILE}" && "${KEY_FILE}" == "${DEFAULT_KEY_FILE}" ]]; then
+  MANAGED_CERT=1
+fi
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   bash "${ROOT_DIR}/scripts/bootstrap_minicpmo45_pytorch_demo_spark.sh"
@@ -25,33 +171,27 @@ fi
 export HF_HOME="${HF_HOME_DIR}"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME_DIR}/hub"
 
-use_http=0
-for arg in "$@"; do
-  case "${arg}" in
-    --http)
-      use_http=1
-      ;;
-    *)
-      echo "Unsupported argument: ${arg}" >&2
-      exit 1
-      ;;
-  esac
-done
-
 mkdir -p "${DEMO_DIR}/tmp"
 
-if [[ "${use_http}" == "0" && ( ! -f "${CERT_FILE}" || ! -f "${KEY_FILE}" ) ]]; then
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo "openssl is required to generate self-signed certs for HTTPS" >&2
+if [[ "${use_http}" == "0" ]]; then
+  if [[ ! -x "${GENERATE_CERT_SCRIPT}" ]]; then
+    echo "Missing TLS helper script: ${GENERATE_CERT_SCRIPT}" >&2
     exit 1
   fi
-  mkdir -p "${CERT_DIR}"
-  echo "==> Generating self-signed TLS cert for MiniCPM-o gateway"
-  openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-    -keyout "${KEY_FILE}" \
-    -out "${CERT_FILE}" \
-    -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+
+  if [[ "${REGENERATE_CERT}" == "1" ]]; then
+    generate_gateway_cert "forced"
+  elif [[ ! -f "${CERT_FILE}" || ! -f "${KEY_FILE}" ]]; then
+    generate_gateway_cert "missing files"
+  elif ! cert_covers_host "${CERT_FILE}" "${PUBLIC_HOST}"; then
+    if [[ "${MANAGED_CERT}" == "1" ]]; then
+      generate_gateway_cert "public host ${PUBLIC_HOST} missing from SAN"
+    else
+      echo "Provided TLS certificate does not cover public host '${PUBLIC_HOST}'." >&2
+      echo "Pass a matching --ssl-certfile/--ssl-keyfile, or re-run with --regen-cert." >&2
+      exit 1
+    fi
+  fi
 fi
 
 if [[ "${use_http}" == "1" ]]; then
@@ -137,18 +277,23 @@ wait_for_gateway_ready() {
 cd "${DEMO_DIR}"
 rm -f tmp/*.pid tmp/*.log
 
+if [[ "${use_http}" == "1" ]]; then
+  PUBLIC_URL="http://${PUBLIC_HOST}:${GATEWAY_PORT}"
+else
+  PUBLIC_URL="https://${PUBLIC_HOST}:${GATEWAY_PORT}"
+fi
+
 echo "=================================================="
 echo "  MiniCPMO45 Service Launcher"
 echo "=================================================="
 echo "  GPUs: ${GPU_LIST} (${NUM_GPUS})"
-
-if [[ "${use_http}" == "1" ]]; then
-  echo "  Gateway: http://localhost:${GATEWAY_PORT}"
-else
-  echo "  Gateway: https://localhost:${GATEWAY_PORT}"
+echo "  Gateway bind: ${GATEWAY_HOST}:${GATEWAY_PORT}"
+echo "  Browser URL:  ${PUBLIC_URL}"
+if [[ "${use_http}" == "0" ]]; then
+  echo "  TLS cert:     ${CERT_FILE}"
+  echo "  TLS key:      ${KEY_FILE}"
 fi
-
-echo "  Workers: localhost:${WORKER_BASE_PORT} ~ localhost:$((WORKER_BASE_PORT + NUM_GPUS - 1)) (HTTP, internal)"
+echo "  Workers:      localhost:${WORKER_BASE_PORT} ~ localhost:$((WORKER_BASE_PORT + NUM_GPUS - 1)) (HTTP, internal)"
 echo "=================================================="
 
 WORKER_ADDRS=""
@@ -199,6 +344,7 @@ if [[ "${use_http}" == "1" ]]; then
     HF_HOME="${HF_HOME}" \
     HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE}" \
     "${VENV_PYTHON}" gateway.py \
+      --host "${GATEWAY_HOST}" \
       --port "${GATEWAY_PORT}" \
       --workers "${WORKER_ADDRS}" \
       --http \
@@ -209,13 +355,16 @@ else
     HF_HOME="${HF_HOME}" \
     HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE}" \
     "${VENV_PYTHON}" gateway.py \
+      --host "${GATEWAY_HOST}" \
       --port "${GATEWAY_PORT}" \
       --workers "${WORKER_ADDRS}" \
+      --ssl-certfile "${CERT_FILE}" \
+      --ssl-keyfile "${KEY_FILE}" \
       > "${gateway_log_path}" 2>&1
 fi
 
 sleep 1
-pgrep -n -f "gateway.py --port ${GATEWAY_PORT} --workers ${WORKER_ADDRS}" > "tmp/gateway.pid"
+pgrep -n -f "gateway.py --host ${GATEWAY_HOST} --port ${GATEWAY_PORT} --workers ${WORKER_ADDRS}" > "tmp/gateway.pid"
 
 if [[ "${use_http}" == "1" ]]; then
   wait_for_gateway_ready "http"
@@ -226,18 +375,10 @@ fi
 echo
 echo "=================================================="
 echo "  Service is running!"
-
-if [[ "${use_http}" == "1" ]]; then
-  echo "  Chat Demo:  http://localhost:${GATEWAY_PORT}"
-  echo "  Admin:      http://localhost:${GATEWAY_PORT}/admin"
-  echo "  API Docs:   http://localhost:${GATEWAY_PORT}/docs"
-else
-  echo "  Chat Demo:  https://localhost:${GATEWAY_PORT}"
-  echo "  Admin:      https://localhost:${GATEWAY_PORT}/admin"
-  echo "  API Docs:   https://localhost:${GATEWAY_PORT}/docs"
-fi
-
-echo "  Workers:    ${WORKER_ADDRS}"
+echo "  Browser URL: ${PUBLIC_URL}"
+echo "  Admin:       ${PUBLIC_URL}/admin"
+echo "  API Docs:    ${PUBLIC_URL}/docs"
+echo "  Workers:     ${WORKER_ADDRS}"
 echo
 echo "  Logs:"
 echo "    Gateway:  tmp/gateway.log"
